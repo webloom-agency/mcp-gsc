@@ -33,7 +33,7 @@ OAUTH_CLIENT_SECRETS_FILE = os.environ.get("GSC_OAUTH_CLIENT_SECRETS_FILE")
 if not OAUTH_CLIENT_SECRETS_FILE:
     OAUTH_CLIENT_SECRETS_FILE = os.path.join(SCRIPT_DIR, "client_secrets.json")
 
-# Token file path for storing OAuth tokens
+# Token file path for storing OAuth tokens (legacy local flow)
 TOKEN_FILE = os.path.join(SCRIPT_DIR, "token.json")
 
 # Environment variable to skip OAuth authentication
@@ -42,7 +42,9 @@ SKIP_OAUTH = os.environ.get("GSC_SKIP_OAUTH", "").lower() in ("true", "1", "yes"
 SCOPES = ["https://www.googleapis.com/auth/webmasters"]
 
 # Prefer a pre-provisioned OAuth token on disk (e.g., saved by HTTP callback) if available
-OAUTH_TOKEN_PATH = os.getenv("GSC_OAUTH_TOKEN_PATH", "/data/gsc_token.json")
+# Default to GOOGLE_MCP_CREDENTIALS_DIR/gsc_token.json, falling back to /data/gsc_token.json
+DEFAULT_CREDENTIALS_DIR = os.getenv("GOOGLE_MCP_CREDENTIALS_DIR") or os.getenv("GSC_MCP_CREDENTIALS_DIR") or "/data"
+OAUTH_TOKEN_PATH = os.getenv("GSC_OAUTH_TOKEN_PATH", os.path.join(DEFAULT_CREDENTIALS_DIR, "gsc_token.json"))
 
 def _load_oauth_credentials_if_any():
     if os.path.exists(OAUTH_TOKEN_PATH):

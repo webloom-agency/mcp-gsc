@@ -13,12 +13,21 @@ import gsc_server  # from the repo (we will ensure it exports/uses a FastMCP ins
 
 # ==== Config (env-driven) ====
 SCOPES = ["https://www.googleapis.com/auth/webmasters"]
+
+# Feature flag to enable OAuth2.1 endpoints (mimic Workspace MCP)
+MCP_ENABLE_OAUTH21 = os.getenv("MCP_ENABLE_OAUTH21", "").lower() in ("1", "true", "yes")
+
+# Prefer Workspace-style envs; keep GSC_* as fallback
+CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID") or os.getenv("GSC_OAUTH_CLIENT_ID")
+CLIENT_SECRET = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET") or os.getenv("GSC_OAUTH_CLIENT_SECRET")
+REDIRECT_URI = os.getenv("GOOGLE_OAUTH_REDIRECT_URI") or os.getenv("GSC_OAUTH_REDIRECT_URI")
+
+# Where to persist refresh token
+CREDENTIALS_DIR = os.getenv("GOOGLE_MCP_CREDENTIALS_DIR") or os.getenv("GSC_MCP_CREDENTIALS_DIR") or "/data"
+TOKEN_PATH = os.getenv("GSC_OAUTH_TOKEN_PATH") or os.path.join(CREDENTIALS_DIR, "gsc_token.json")
+
+# Optional client secrets file (fallback if client id/secret not provided)
 CLIENT_SECRETS = os.getenv("GSC_OAUTH_CLIENT_SECRETS_FILE", "/etc/secrets/client_secrets.json")
-TOKEN_PATH = os.getenv("GSC_OAUTH_TOKEN_PATH", "/data/gsc_token.json")
-# Accept either GSC_* or GOOGLE_* names for convenience
-CLIENT_ID = os.getenv("GSC_OAUTH_CLIENT_ID") or os.getenv("GOOGLE_OAUTH_CLIENT_ID")
-CLIENT_SECRET = os.getenv("GSC_OAUTH_CLIENT_SECRET") or os.getenv("GOOGLE_OAUTH_CLIENT_SECRET")
-REDIRECT_URI = os.getenv("GSC_OAUTH_REDIRECT_URI") or os.getenv("GOOGLE_OAUTH_REDIRECT_URI")  # must be set
 
 # ---- Bearer auth middleware ----
 class BearerAuthMiddleware(BaseHTTPMiddleware):
@@ -66,15 +75,17 @@ def _flow():
 
 
 def _validate_oauth_env():
+    if not MCP_ENABLE_OAUTH21:
+        return "MCP_ENABLE_OAUTH21 is not enabled. Set it to true to use OAuth endpoints."
     if not REDIRECT_URI:
-        return "GSC_OAUTH_REDIRECT_URI (or GOOGLE_OAUTH_REDIRECT_URI) is not set."
+        return "GOOGLE_OAUTH_REDIRECT_URI (or GSC_OAUTH_REDIRECT_URI) is not set."
     # Valid if either env client config or secrets file exists
     if CLIENT_ID and CLIENT_SECRET:
         return None
     if os.path.exists(CLIENT_SECRETS):
         return None
     return (
-        "No OAuth client configured. Provide GSC_OAUTH_CLIENT_ID and GSC_OAUTH_CLIENT_SECRET (or GOOGLE_* vars) "
+        "No OAuth client configured. Provide GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET (or GSC_* vars) "
         "or mount a client secrets file and set GSC_OAUTH_CLIENT_SECRETS_FILE."
     )
 
