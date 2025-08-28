@@ -20,6 +20,10 @@ REDIRECT_URI = os.getenv("GSC_OAUTH_REDIRECT_URI")  # must be set on Render
 # ---- Bearer auth middleware ----
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
+        # allow OAuth endpoints without Bearer
+        path = request.url.path
+        if path.startswith("/oauth2/"):
+            return await call_next(request)
         required = os.getenv("MCP_BEARER_TOKEN")
         if required:
             auth = request.headers.get("Authorization", "")
@@ -55,6 +59,26 @@ async def oauth_callback(request: Request):
         f.write(creds.to_json())
     return JSONResponse({"status": "ok"})
 
+async def oauth_exchange(request: Request):
+    # Accept forwarded authorization_response (GET query or POST JSON)
+    authorization_response = request.query_params.get("authorization_response")
+    if not authorization_response and request.method == "POST":
+        try:
+            body = await request.json()
+            authorization_response = body.get("authorization_response")
+        except Exception:
+            authorization_response = None
+    if not authorization_response:
+        return JSONResponse({"error": "authorization_response is required"}, status_code=400)
+
+    flow = _flow()
+    flow.fetch_token(authorization_response=authorization_response)
+    creds = flow.credentials
+    os.makedirs(os.path.dirname(TOKEN_PATH), exist_ok=True)
+    with open(TOKEN_PATH, "w") as f:
+        f.write(creds.to_json())
+    return JSONResponse({"status": "ok"})
+
 # ---- Wire the MCP server (exported by gsc_server) to Streamable HTTP ----
 try:
     mcp = getattr(gsc_server, "mcp")
@@ -73,6 +97,7 @@ async def lifespan(app):
 routes = [
     Route("/oauth2/start", oauth_start),
     Route("/oauth2/callback", oauth_callback),
+    Route("/oauth2/exchange", oauth_exchange),
     # Mount MCP server Streamable HTTP app at '/' (its endpoints are under /mcp by default)
     Mount("/", app=mcp.streamable_http_app()),
 ]
