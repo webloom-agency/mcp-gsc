@@ -13,6 +13,7 @@ from googleapiclient.errors import HttpError
 from urllib.parse import urlparse
 import httplib2
 import google_auth_httplib2
+import asyncio
 
 # MCP
 from mcp.server.fastmcp import FastMCP
@@ -46,9 +47,26 @@ SCOPES = ["https://www.googleapis.com/auth/webmasters"]
 
 # HTTP timeout for Google API calls (seconds)
 try:
-    GSC_HTTP_TIMEOUT_SECONDS = int(os.getenv("GSC_HTTP_TIMEOUT_SECONDS", "30"))
+    GSC_HTTP_TIMEOUT_SECONDS = int(os.getenv("GSC_HTTP_TIMEOUT_SECONDS", "120"))
 except ValueError:
-    GSC_HTTP_TIMEOUT_SECONDS = 30
+    GSC_HTTP_TIMEOUT_SECONDS = 120
+
+# Retry/backoff configuration for Google API calls
+def _get_int_env(name: str, default_value: int) -> int:
+    try:
+        return int(os.getenv(name, str(default_value)))
+    except Exception:
+        return default_value
+
+def _get_float_env(name: str, default_value: float) -> float:
+    try:
+        return float(os.getenv(name, str(default_value)))
+    except Exception:
+        return default_value
+
+GSC_REQUEST_RETRIES = _get_int_env("GSC_REQUEST_RETRIES", 3)
+GSC_RETRY_BACKOFF_SECONDS = _get_float_env("GSC_RETRY_BACKOFF_SECONDS", 1.5)
+GSC_SLEEP_BETWEEN_REQUESTS_MS = _get_int_env("GSC_SLEEP_BETWEEN_REQUESTS_MS", 200)
 
 # Prefer a pre-provisioned OAuth token on disk (e.g., saved by HTTP callback) if available
 # Default to GOOGLE_MCP_CREDENTIALS_DIR/gsc_token.json, falling back to /data/gsc_token.json
@@ -67,6 +85,20 @@ def _build_gsc_service(creds: Credentials):
     http = httplib2.Http(timeout=GSC_HTTP_TIMEOUT_SECONDS)
     authed_http = google_auth_httplib2.AuthorizedHttp(creds, http=http)
     return build("searchconsole", "v1", http=authed_http)
+
+# Simple retry helper for synchronous googleapiclient .execute()
+async def _execute_with_retries(execute_callable):
+    last_exc = None
+    for attempt in range(GSC_REQUEST_RETRIES + 1):
+        try:
+            return execute_callable()
+        except Exception as e:
+            last_exc = e
+            if attempt >= GSC_REQUEST_RETRIES:
+                break
+            backoff = max(0.0, (GSC_RETRY_BACKOFF_SECONDS ** attempt))
+            await asyncio.sleep(backoff)
+    raise last_exc
 
 # --- Property resolution helpers ---
 
@@ -569,7 +601,7 @@ async def inspect_url_enhanced(site_url: str, page_url: str) -> str:
         }
         
         # Execute request
-        response = service.urlInspection().index().inspect(body=request).execute()
+        response = await _execute_with_retries(lambda: service.urlInspection().index().inspect(body=request).execute())
         
         if not response or "inspectionResult" not in response:
             return f"No inspection data found for {page_url}."
@@ -701,11 +733,14 @@ async def batch_url_inspection(site_url: str, urls: str) -> str:
             }
             
             try:
-                # Execute request with a small delay to avoid rate limits
-                response = service.urlInspection().index().inspect(body=request).execute()
+                # Execute request with retries
+                response = await _execute_with_retries(lambda: service.urlInspection().index().inspect(body=request).execute())
                 
                 if not response or "inspectionResult" not in response:
                     results.append(f"{page_url}: No inspection data found")
+                    # Sleep between requests if configured
+                    if GSC_SLEEP_BETWEEN_REQUESTS_MS > 0:
+                        await asyncio.sleep(GSC_SLEEP_BETWEEN_REQUESTS_MS / 1000.0)
                     continue
                 
                 inspection = response["inspectionResult"]
@@ -736,6 +771,10 @@ async def batch_url_inspection(site_url: str, urls: str) -> str:
             
             except Exception as e:
                 results.append(f"{page_url}: Error - {str(e)}")
+            
+            # Sleep between requests if configured
+            if GSC_SLEEP_BETWEEN_REQUESTS_MS > 0:
+                await asyncio.sleep(GSC_SLEEP_BETWEEN_REQUESTS_MS / 1000.0)
         
         # Combine results
         return f"Batch URL Inspection Results for {site_url}:\n\n" + "\n".join(results)
@@ -784,10 +823,12 @@ async def check_indexing_issues(site_url: str, urls: str) -> str:
             
             try:
                 # Execute request
-                response = service.urlInspection().index().inspect(body=request).execute()
+                response = await _execute_with_retries(lambda: service.urlInspection().index().inspect(body=request).execute())
                 
                 if not response or "inspectionResult" not in response:
                     issues_summary["not_indexed"].append(f"{page_url} - No inspection data found")
+                    if GSC_SLEEP_BETWEEN_REQUESTS_MS > 0:
+                        await asyncio.sleep(GSC_SLEEP_BETWEEN_REQUESTS_MS / 1000.0)
                     continue
                 
                 inspection = response["inspectionResult"]
@@ -798,68 +839,51 @@ async def check_indexing_issues(site_url: str, urls: str) -> str:
                 coverage = index_status.get("coverageState", "Unknown")
                 
                 if verdict != "PASS" or "not indexed" in coverage.lower() or "excluded" in coverage.lower():
-                    issues_summary["not_indexed"].append(f"{page_url} - {coverage}")
+                    issues_summary["not_indexed"].append(f"{page_url} - {verdict} ({coverage})")
                 else:
-                    issues_summary["indexed"].append(page_url)
+                    issues_summary["indexed"].append(f"{page_url} - {verdict} ({coverage})")
                 
                 # Check canonical issues
-                google_canonical = index_status.get("googleCanonical", "")
-                user_canonical = index_status.get("userCanonical", "")
+                google_canonical = index_status.get("googleCanonical")
+                user_canonical = index_status.get("userCanonical")
+                if user_canonical and google_canonical and user_canonical != google_canonical:
+                    issues_summary["canonical_issues"].append(f"{page_url} - User: {user_canonical}, Google: {google_canonical}")
                 
-                if google_canonical and user_canonical and google_canonical != user_canonical:
-                    issues_summary["canonical_issues"].append(
-                        f"{page_url} - Google chose: {google_canonical} instead of user-declared: {user_canonical}"
-                    )
-                
-                # Check robots.txt status
-                robots_state = index_status.get("robotsTxtState", "")
-                if robots_state == "BLOCKED":
-                    issues_summary["robots_blocked"].append(page_url)
+                # Check robots.txt issues
+                robots_state = index_status.get("robotsTxtState", "").lower()
+                if "blocked" in robots_state:
+                    issues_summary["robots_blocked"].append(f"{page_url} - Robots: {index_status.get('robotsTxtState', 'Unknown')}")
                 
                 # Check fetch issues
-                fetch_state = index_status.get("pageFetchState", "")
-                if fetch_state != "SUCCESSFUL":
-                    issues_summary["fetch_issues"].append(f"{page_url} - {fetch_state}")
+                fetch_state = index_status.get("pageFetchState", "").lower()
+                if fetch_state and fetch_state not in ("ok", "success"):
+                    issues_summary["fetch_issues"].append(f"{page_url} - Fetch: {index_status.get('pageFetchState', 'Unknown')}")
             
             except Exception as e:
-                issues_summary["not_indexed"].append(f"{page_url} - Error: {str(e)}")
+                issues_summary["fetch_issues"].append(f"{page_url} - Error: {str(e)}")
+            
+            if GSC_SLEEP_BETWEEN_REQUESTS_MS > 0:
+                await asyncio.sleep(GSC_SLEEP_BETWEEN_REQUESTS_MS / 1000.0)
         
-        # Format results
-        result_lines = [f"Indexing Issues Report for {site_url}:"]
-        result_lines.append("-" * 80)
+        # Format summary
+        result_lines = [f"Indexing Issues Summary for {site_url}:"]
+        result_lines.append("-" * 60)
         
-        # Summary counts
-        result_lines.append(f"Total URLs checked: {len(url_list)}")
-        result_lines.append(f"Indexed: {len(issues_summary['indexed'])}")
-        result_lines.append(f"Not indexed: {len(issues_summary['not_indexed'])}")
-        result_lines.append(f"Canonical issues: {len(issues_summary['canonical_issues'])}")
-        result_lines.append(f"Robots.txt blocked: {len(issues_summary['robots_blocked'])}")
-        result_lines.append(f"Fetch issues: {len(issues_summary['fetch_issues'])}")
-        result_lines.append("-" * 80)
+        def _format_section(title: str, items: List[str]):
+            result_lines.append(f"\n{title} ({len(items)}):")
+            if not items:
+                result_lines.append("  - None")
+            else:
+                for item in items:
+                    result_lines.append(f"  - {item}")
         
-        # Detailed issues
-        if issues_summary["not_indexed"]:
-            result_lines.append("\nNot Indexed URLs:")
-            for issue in issues_summary["not_indexed"]:
-                result_lines.append(f"- {issue}")
-        
-        if issues_summary["canonical_issues"]:
-            result_lines.append("\nCanonical Issues:")
-            for issue in issues_summary["canonical_issues"]:
-                result_lines.append(f"- {issue}")
-        
-        if issues_summary["robots_blocked"]:
-            result_lines.append("\nRobots.txt Blocked URLs:")
-            for url in issues_summary["robots_blocked"]:
-                result_lines.append(f"- {url}")
-        
-        if issues_summary["fetch_issues"]:
-            result_lines.append("\nFetch Issues:")
-            for issue in issues_summary["fetch_issues"]:
-                result_lines.append(f"- {issue}")
+        _format_section("Indexed", issues_summary["indexed"])
+        _format_section("Not Indexed / Excluded", issues_summary["not_indexed"])
+        _format_section("Canonical Issues", issues_summary["canonical_issues"])
+        _format_section("Robots Blocked", issues_summary["robots_blocked"])
+        _format_section("Fetch Issues / Errors", issues_summary["fetch_issues"])
         
         return "\n".join(result_lines)
-    
     except Exception as e:
         return f"Error checking indexing issues: {str(e)}"
 
