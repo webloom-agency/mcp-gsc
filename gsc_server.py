@@ -546,6 +546,7 @@ async def inspect_url_enhanced(site_url: str, page_url: str) -> str:
     """
     try:
         service = get_gsc_service()
+        site_url = _resolve_site_url(service, site_url)
         
         # Build request
         request = {
@@ -664,6 +665,7 @@ async def batch_url_inspection(site_url: str, urls: str) -> str:
     """
     try:
         service = get_gsc_service()
+        site_url = _resolve_site_url(service, site_url)
         
         # Parse URLs
         url_list = [url.strip() for url in urls.split('\n') if url.strip()]
@@ -738,6 +740,7 @@ async def check_indexing_issues(site_url: str, urls: str) -> str:
     """
     try:
         service = get_gsc_service()
+        site_url = _resolve_site_url(service, site_url)
         
         # Parse URLs
         url_list = [url.strip() for url in urls.split('\n') if url.strip()]
@@ -961,6 +964,7 @@ async def get_advanced_search_analytics(
     """
     try:
         service = get_gsc_service()
+        site_url = _resolve_site_url(service, site_url)
         
         # Calculate date range if not provided
         if not end_date:
@@ -1084,6 +1088,7 @@ async def compare_search_periods(
     """
     try:
         service = get_gsc_service()
+        site_url = _resolve_site_url(service, site_url)
         
         # Parse dimensions
         dimension_list = [d.strip() for d in dimensions.split(",")]
