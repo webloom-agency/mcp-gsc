@@ -11,6 +11,8 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from urllib.parse import urlparse
+import httplib2
+import google_auth_httplib2
 
 # MCP
 from mcp.server.fastmcp import FastMCP
@@ -42,6 +44,12 @@ SKIP_OAUTH = os.environ.get("GSC_SKIP_OAUTH", "").lower() in ("true", "1", "yes"
 
 SCOPES = ["https://www.googleapis.com/auth/webmasters"]
 
+# HTTP timeout for Google API calls (seconds)
+try:
+    GSC_HTTP_TIMEOUT_SECONDS = int(os.getenv("GSC_HTTP_TIMEOUT_SECONDS", "30"))
+except ValueError:
+    GSC_HTTP_TIMEOUT_SECONDS = 30
+
 # Prefer a pre-provisioned OAuth token on disk (e.g., saved by HTTP callback) if available
 # Default to GOOGLE_MCP_CREDENTIALS_DIR/gsc_token.json, falling back to /data/gsc_token.json
 DEFAULT_CREDENTIALS_DIR = os.getenv("GOOGLE_MCP_CREDENTIALS_DIR") or os.getenv("GSC_MCP_CREDENTIALS_DIR") or "/data"
@@ -53,6 +61,12 @@ def _load_oauth_credentials_if_any():
             data = json.load(f)
         return Credentials.from_authorized_user_info(data, scopes=SCOPES)
     return None
+
+# Build a Search Console client using an authorized HTTP with timeout
+def _build_gsc_service(creds: Credentials):
+    http = httplib2.Http(timeout=GSC_HTTP_TIMEOUT_SECONDS)
+    authed_http = google_auth_httplib2.AuthorizedHttp(creds, http=http)
+    return build("searchconsole", "v1", http=authed_http)
 
 # --- Property resolution helpers ---
 
@@ -155,7 +169,7 @@ def get_gsc_service():
         # Prefer credentials loaded from a persisted token file (for non-interactive environments)
         creds = _load_oauth_credentials_if_any()
         if creds is not None:
-            return build("searchconsole", "v1", credentials=creds)
+            return _build_gsc_service(creds)
         try:
             return get_gsc_service_oauth()
         except Exception as e:
@@ -169,7 +183,7 @@ def get_gsc_service():
                 creds = service_account.Credentials.from_service_account_file(
                     cred_path, scopes=SCOPES
                 )
-                return build("searchconsole", "v1", credentials=creds)
+                return _build_gsc_service(creds)
             except Exception as e:
                 continue  # Try the next path if this one fails
     
@@ -212,7 +226,7 @@ def get_gsc_service_oauth():
                 token.write(creds.to_json())
     
     # Build and return the service
-    return build("searchconsole", "v1", credentials=creds)
+    return _build_gsc_service(creds)
 
 @mcp.tool()
 async def list_properties() -> str:
