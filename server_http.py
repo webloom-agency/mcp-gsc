@@ -79,6 +79,22 @@ def _validate_oauth_env():
     )
 
 
+async def oauth_authorize(request: Request):
+    err = _validate_oauth_env()
+    if err:
+        return JSONResponse({"error": err}, status_code=500)
+    try:
+        flow = _flow()
+        auth_url, state = flow.authorization_url(
+            access_type="offline",
+            include_granted_scopes=False,
+            prompt="consent",
+        )
+        return JSONResponse({"auth_url": auth_url, "state": state})
+    except Exception as e:
+        return JSONResponse({"error": f"oauth_authorize failed: {str(e)}"}, status_code=500)
+
+
 async def oauth_start(request: Request):
     err = _validate_oauth_env()
     if err:
@@ -155,6 +171,7 @@ async def lifespan(app):
         yield
 
 routes = [
+    Route("/oauth2/authorize", oauth_authorize),
     Route("/oauth2/start", oauth_start),
     Route("/oauth2/callback", oauth_callback),
     Route("/oauth2/exchange", oauth_exchange),
