@@ -41,6 +41,16 @@ SKIP_OAUTH = os.environ.get("GSC_SKIP_OAUTH", "").lower() in ("true", "1", "yes"
 
 SCOPES = ["https://www.googleapis.com/auth/webmasters"]
 
+# Prefer a pre-provisioned OAuth token on disk (e.g., saved by HTTP callback) if available
+OAUTH_TOKEN_PATH = os.getenv("GSC_OAUTH_TOKEN_PATH", "/data/gsc_token.json")
+
+def _load_oauth_credentials_if_any():
+    if os.path.exists(OAUTH_TOKEN_PATH):
+        with open(OAUTH_TOKEN_PATH) as f:
+            data = json.load(f)
+        return Credentials.from_authorized_user_info(data, scopes=SCOPES)
+    return None
+
 def get_gsc_service():
     """
     Returns an authorized Search Console service object.
@@ -48,6 +58,10 @@ def get_gsc_service():
     """
     # Try OAuth authentication first if not skipped
     if not SKIP_OAUTH:
+        # Prefer credentials loaded from a persisted token file (for non-interactive environments)
+        creds = _load_oauth_credentials_if_any()
+        if creds is not None:
+            return build("searchconsole", "v1", credentials=creds)
         try:
             return get_gsc_service_oauth()
         except Exception as e:
