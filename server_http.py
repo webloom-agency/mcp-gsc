@@ -39,45 +39,70 @@ def _flow():
         redirect_uri=REDIRECT_URI,
     )
 
+def _validate_oauth_env():
+    if not os.path.exists(CLIENT_SECRETS):
+        return f"Client secrets not found at {CLIENT_SECRETS}. Set GSC_OAUTH_CLIENT_SECRETS_FILE."
+    if not REDIRECT_URI:
+        return "GSC_OAUTH_REDIRECT_URI is not set."
+    return None
+
 async def oauth_start(request: Request):
-    flow = _flow()
-    auth_url, state = flow.authorization_url(
-        access_type="offline",
-        include_granted_scopes="true",
-        prompt="consent",
-    )
-    # you can store state in signed cookies/session if desired; for simplicity we skip it here
-    return RedirectResponse(auth_url)
+    err = _validate_oauth_env()
+    if err:
+        return JSONResponse({"error": err}, status_code=500)
+    try:
+        flow = _flow()
+        auth_url, state = flow.authorization_url(
+            access_type="offline",
+            include_granted_scopes="true",
+            prompt="consent",
+        )
+        # you can store state in signed cookies/session if desired; for simplicity we skip it here
+        return RedirectResponse(auth_url)
+    except Exception as e:
+        return JSONResponse({"error": f"oauth_start failed: {str(e)}"}, status_code=500)
 
 async def oauth_callback(request: Request):
-    # Rebuild flow and exchange code
-    flow = _flow()
-    flow.fetch_token(authorization_response=str(request.url))
-    creds = flow.credentials
-    os.makedirs(os.path.dirname(TOKEN_PATH), exist_ok=True)
-    with open(TOKEN_PATH, "w") as f:
-        f.write(creds.to_json())
-    return JSONResponse({"status": "ok"})
+    err = _validate_oauth_env()
+    if err:
+        return JSONResponse({"error": err}, status_code=500)
+    try:
+        # Rebuild flow and exchange code
+        flow = _flow()
+        flow.fetch_token(authorization_response=str(request.url))
+        creds = flow.credentials
+        os.makedirs(os.path.dirname(TOKEN_PATH), exist_ok=True)
+        with open(TOKEN_PATH, "w") as f:
+            f.write(creds.to_json())
+        return JSONResponse({"status": "ok", "token_path": TOKEN_PATH})
+    except Exception as e:
+        return JSONResponse({"error": f"oauth_callback failed: {str(e)}", "token_path": TOKEN_PATH}, status_code=500)
 
 async def oauth_exchange(request: Request):
+    err = _validate_oauth_env()
+    if err:
+        return JSONResponse({"error": err}, status_code=500)
     # Accept forwarded authorization_response (GET query or POST JSON)
-    authorization_response = request.query_params.get("authorization_response")
-    if not authorization_response and request.method == "POST":
-        try:
-            body = await request.json()
-            authorization_response = body.get("authorization_response")
-        except Exception:
-            authorization_response = None
-    if not authorization_response:
-        return JSONResponse({"error": "authorization_response is required"}, status_code=400)
+    try:
+        authorization_response = request.query_params.get("authorization_response")
+        if not authorization_response and request.method == "POST":
+            try:
+                body = await request.json()
+                authorization_response = body.get("authorization_response")
+            except Exception:
+                authorization_response = None
+        if not authorization_response:
+            return JSONResponse({"error": "authorization_response is required"}, status_code=400)
 
-    flow = _flow()
-    flow.fetch_token(authorization_response=authorization_response)
-    creds = flow.credentials
-    os.makedirs(os.path.dirname(TOKEN_PATH), exist_ok=True)
-    with open(TOKEN_PATH, "w") as f:
-        f.write(creds.to_json())
-    return JSONResponse({"status": "ok"})
+        flow = _flow()
+        flow.fetch_token(authorization_response=authorization_response)
+        creds = flow.credentials
+        os.makedirs(os.path.dirname(TOKEN_PATH), exist_ok=True)
+        with open(TOKEN_PATH, "w") as f:
+            f.write(creds.to_json())
+        return JSONResponse({"status": "ok", "token_path": TOKEN_PATH})
+    except Exception as e:
+        return JSONResponse({"error": f"oauth_exchange failed: {str(e)}", "token_path": TOKEN_PATH}, status_code=500)
 
 # ---- Wire the MCP server (exported by gsc_server) to Streamable HTTP ----
 try:
