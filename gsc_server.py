@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 import httplib2
 import google_auth_httplib2
 import asyncio
+import random
 
 # MCP
 from mcp.server.fastmcp import FastMCP
@@ -47,9 +48,9 @@ SCOPES = ["https://www.googleapis.com/auth/webmasters"]
 
 # HTTP timeout for Google API calls (seconds)
 try:
-    GSC_HTTP_TIMEOUT_SECONDS = int(os.getenv("GSC_HTTP_TIMEOUT_SECONDS", "120"))
+    GSC_HTTP_TIMEOUT_SECONDS = int(os.getenv("GSC_HTTP_TIMEOUT_SECONDS", "180"))
 except ValueError:
-    GSC_HTTP_TIMEOUT_SECONDS = 120
+    GSC_HTTP_TIMEOUT_SECONDS = 180
 
 # Retry/backoff configuration for Google API calls
 def _get_int_env(name: str, default_value: int) -> int:
@@ -64,9 +65,12 @@ def _get_float_env(name: str, default_value: float) -> float:
     except Exception:
         return default_value
 
-GSC_REQUEST_RETRIES = _get_int_env("GSC_REQUEST_RETRIES", 3)
-GSC_RETRY_BACKOFF_SECONDS = _get_float_env("GSC_RETRY_BACKOFF_SECONDS", 1.5)
-GSC_SLEEP_BETWEEN_REQUESTS_MS = _get_int_env("GSC_SLEEP_BETWEEN_REQUESTS_MS", 200)
+GSC_REQUEST_RETRIES = _get_int_env("GSC_REQUEST_RETRIES", 5)
+GSC_RETRY_BACKOFF_SECONDS = _get_float_env("GSC_RETRY_BACKOFF_SECONDS", 2.0)
+GSC_SLEEP_BETWEEN_REQUESTS_MS = _get_int_env("GSC_SLEEP_BETWEEN_REQUESTS_MS", 1000)
+GSC_RETRY_JITTER_MS = _get_int_env("GSC_RETRY_JITTER_MS", 300)
+GSC_MAX_CONCURRENT_INSPECTIONS = _get_int_env("GSC_MAX_CONCURRENT_INSPECTIONS", 1)
+INSPECTION_SEMAPHORE = asyncio.Semaphore(max(1, GSC_MAX_CONCURRENT_INSPECTIONS))
 
 # Prefer a pre-provisioned OAuth token on disk (e.g., saved by HTTP callback) if available
 # Default to GOOGLE_MCP_CREDENTIALS_DIR/gsc_token.json, falling back to /data/gsc_token.json
@@ -91,13 +95,23 @@ async def _execute_with_retries(execute_callable):
     last_exc = None
     for attempt in range(GSC_REQUEST_RETRIES + 1):
         try:
-            return execute_callable()
+            # Run blocking execute() off the event loop
+            return await asyncio.to_thread(execute_callable)
+        except HttpError as e:
+            last_exc = e
+            status = getattr(getattr(e, "resp", None), "status", None)
+            # Transient errors to retry
+            if status in {408, 429, 500, 502, 503, 504}:
+                pass
+            else:
+                raise
         except Exception as e:
             last_exc = e
-            if attempt >= GSC_REQUEST_RETRIES:
-                break
-            backoff = max(0.0, (GSC_RETRY_BACKOFF_SECONDS ** attempt))
-            await asyncio.sleep(backoff)
+        # Backoff with jitter
+        if attempt < GSC_REQUEST_RETRIES:
+            backoff = (GSC_RETRY_BACKOFF_SECONDS ** (attempt + 1))
+            jitter = random.uniform(0, max(0, GSC_RETRY_JITTER_MS) / 1000.0)
+            await asyncio.sleep(backoff + jitter)
     raise last_exc
 
 # --- Property resolution helpers ---
@@ -591,112 +605,116 @@ async def inspect_url_enhanced(site_url: str, page_url: str) -> str:
         page_url: The specific URL to inspect
     """
     try:
-        service = get_gsc_service()
-        site_url = _resolve_site_url(service, site_url)
-        
-        # Build request
-        request = {
-            "inspectionUrl": page_url,
-            "siteUrl": site_url
-        }
-        
-        # Execute request
-        response = await _execute_with_retries(lambda: service.urlInspection().index().inspect(body=request).execute())
-        
-        if not response or "inspectionResult" not in response:
-            return f"No inspection data found for {page_url}."
-        
-        inspection = response["inspectionResult"]
-        
-        # Format the results
-        result_lines = [f"URL Inspection for {page_url}:"]
-        result_lines.append("-" * 80)
-        
-        # Add inspection result link if available
-        if "inspectionResultLink" in inspection:
-            result_lines.append(f"Search Console Link: {inspection['inspectionResultLink']}")
+        await INSPECTION_SEMAPHORE.acquire()
+        try:
+            service = get_gsc_service()
+            site_url = _resolve_site_url(service, site_url)
+            
+            # Build request
+            request = {
+                "inspectionUrl": page_url,
+                "siteUrl": site_url
+            }
+            
+            # Execute request
+            response = await _execute_with_retries(lambda: service.urlInspection().index().inspect(body=request).execute())
+            
+            if not response or "inspectionResult" not in response:
+                return f"No inspection data found for {page_url}."
+            
+            inspection = response["inspectionResult"]
+            
+            # Format the results
+            result_lines = [f"URL Inspection for {page_url}:"]
             result_lines.append("-" * 80)
-        
-        # Indexing status section
-        index_status = inspection.get("indexStatusResult", {})
-        verdict = index_status.get("verdict", "UNKNOWN")
-        
-        result_lines.append(f"Indexing Status: {verdict}")
-        
-        # Coverage state
-        if "coverageState" in index_status:
-            result_lines.append(f"Coverage: {index_status['coverageState']}")
-        
-        # Last crawl
-        if "lastCrawlTime" in index_status:
-            try:
-                crawl_time = datetime.fromisoformat(index_status["lastCrawlTime"].replace('Z', '+00:00'))
-                result_lines.append(f"Last Crawled: {crawl_time.strftime('%Y-%m-%d %H:%M')}")
-            except:
-                result_lines.append(f"Last Crawled: {index_status['lastCrawlTime']}")
-        
-        # Page fetch
-        if "pageFetchState" in index_status:
-            result_lines.append(f"Page Fetch: {index_status['pageFetchState']}")
-        
-        # Robots.txt status
-        if "robotsTxtState" in index_status:
-            result_lines.append(f"Robots.txt: {index_status['robotsTxtState']}")
-        
-        # Indexing state
-        if "indexingState" in index_status:
-            result_lines.append(f"Indexing State: {index_status['indexingState']}")
-        
-        # Canonical information
-        if "googleCanonical" in index_status:
-            result_lines.append(f"Google Canonical: {index_status['googleCanonical']}")
-        
-        if "userCanonical" in index_status and index_status.get("userCanonical") != index_status.get("googleCanonical"):
-            result_lines.append(f"User Canonical: {index_status['userCanonical']}")
-        
-        # Crawled as
-        if "crawledAs" in index_status:
-            result_lines.append(f"Crawled As: {index_status['crawledAs']}")
-        
-        # Referring URLs
-        if "referringUrls" in index_status and index_status["referringUrls"]:
-            result_lines.append("\nReferring URLs:")
-            for url in index_status["referringUrls"][:5]:  # Limit to 5 examples
-                result_lines.append(f"- {url}")
             
-            if len(index_status["referringUrls"]) > 5:
-                result_lines.append(f"... and {len(index_status['referringUrls']) - 5} more")
-        
-        # Rich results
-        if "richResultsResult" in inspection:
-            rich = inspection["richResultsResult"]
-            result_lines.append(f"\nRich Results: {rich.get('verdict', 'UNKNOWN')}")
+            # Add inspection result link if available
+            if "inspectionResultLink" in inspection:
+                result_lines.append(f"Search Console Link: {inspection['inspectionResultLink']}")
+                result_lines.append("-" * 80)
             
-            if "detectedItems" in rich and rich["detectedItems"]:
-                result_lines.append("Detected Rich Result Types:")
+            # Indexing status section
+            index_status = inspection.get("indexStatusResult", {})
+            verdict = index_status.get("verdict", "UNKNOWN")
+            
+            result_lines.append(f"Indexing Status: {verdict}")
+            
+            # Coverage state
+            if "coverageState" in index_status:
+                result_lines.append(f"Coverage: {index_status['coverageState']}")
+            
+            # Last crawl
+            if "lastCrawlTime" in index_status:
+                try:
+                    crawl_time = datetime.fromisoformat(index_status["lastCrawlTime"].replace('Z', '+00:00'))
+                    result_lines.append(f"Last Crawled: {crawl_time.strftime('%Y-%m-%d %H:%M')}")
+                except:
+                    result_lines.append(f"Last Crawled: {index_status['lastCrawlTime']}")
+            
+            # Page fetch
+            if "pageFetchState" in index_status:
+                result_lines.append(f"Page Fetch: {index_status['pageFetchState']}")
+            
+            # Robots.txt status
+            if "robotsTxtState" in index_status:
+                result_lines.append(f"Robots.txt: {index_status['robotsTxtState']}")
+            
+            # Indexing state
+            if "indexingState" in index_status:
+                result_lines.append(f"Indexing State: {index_status['indexingState']}")
+            
+            # Canonical information
+            if "googleCanonical" in index_status:
+                result_lines.append(f"Google Canonical: {index_status['googleCanonical']}")
+            
+            if "userCanonical" in index_status and index_status.get("userCanonical") != index_status.get("googleCanonical"):
+                result_lines.append(f"User Canonical: {index_status['userCanonical']}")
+            
+            # Crawled as
+            if "crawledAs" in index_status:
+                result_lines.append(f"Crawled As: {index_status['crawledAs']}")
+            
+            # Referring URLs
+            if "referringUrls" in index_status and index_status["referringUrls"]:
+                result_lines.append("\nReferring URLs:")
+                for url in index_status["referringUrls"][:5]:  # Limit to 5 examples
+                    result_lines.append(f"- {url}")
                 
-                for item in rich["detectedItems"]:
-                    rich_type = item.get("richResultType", "Unknown")
-                    result_lines.append(f"- {rich_type}")
-                    
-                    # If there are items with names, show them
-                    if "items" in item and item["items"]:
-                        for i, subitem in enumerate(item["items"][:3]):  # Limit to 3 examples
-                            if "name" in subitem:
-                                result_lines.append(f"  • {subitem['name']}")
-                        
-                        if len(item["items"]) > 3:
-                            result_lines.append(f"  • ... and {len(item['items']) - 3} more items")
+                if len(index_status["referringUrls"]) > 5:
+                    result_lines.append(f"... and {len(index_status['referringUrls']) - 5} more")
             
-            # Check for issues
-            if "richResultsIssues" in rich and rich["richResultsIssues"]:
-                result_lines.append("\nRich Results Issues:")
-                for issue in rich["richResultsIssues"]:
-                    severity = issue.get("severity", "Unknown")
-                    message = issue.get("message", "Unknown issue")
-                    result_lines.append(f"- [{severity}] {message}")
-        
-        return "\n".join(result_lines)
+            # Rich results
+            if "richResultsResult" in inspection:
+                rich = inspection["richResultsResult"]
+                result_lines.append(f"\nRich Results: {rich.get('verdict', 'UNKNOWN')}")
+                
+                if "detectedItems" in rich and rich["detectedItems"]:
+                    result_lines.append("Detected Rich Result Types:")
+                    
+                    for item in rich["detectedItems"]:
+                        rich_type = item.get("richResultType", "Unknown")
+                        result_lines.append(f"- {rich_type}")
+                        
+                        # If there are items with names, show them
+                        if "items" in item and item["items"]:
+                            for i, subitem in enumerate(item["items"][:3]):  # Limit to 3 examples
+                                if "name" in subitem:
+                                    result_lines.append(f"  • {subitem['name']}")
+                            
+                            if len(item["items"]) > 3:
+                                result_lines.append(f"  • ... and {len(item['items']) - 3} more items")
+                
+                # Check for issues
+                if "richResultsIssues" in rich and rich["richResultsIssues"]:
+                    result_lines.append("\nRich Results Issues:")
+                    for issue in rich["richResultsIssues"]:
+                        severity = issue.get("severity", "Unknown")
+                        message = issue.get("message", "Unknown issue")
+                        result_lines.append(f"- [{severity}] {message}")
+            
+            return "\n".join(result_lines)
+        finally:
+            INSPECTION_SEMAPHORE.release()
     except Exception as e:
         return f"Error inspecting URL: {str(e)}"
 
@@ -710,74 +728,78 @@ async def batch_url_inspection(site_url: str, urls: str) -> str:
         urls: List of URLs to inspect, one per line
     """
     try:
-        service = get_gsc_service()
-        site_url = _resolve_site_url(service, site_url)
-        
-        # Parse URLs
-        url_list = [url.strip() for url in urls.split('\n') if url.strip()]
-        
-        if not url_list:
-            return "No URLs provided for inspection."
-        
-        if len(url_list) > 10:
-            return f"Too many URLs provided ({len(url_list)}). Please limit to 10 URLs per batch to avoid API quota issues."
-        
-        # Process each URL
-        results = []
-        
-        for page_url in url_list:
-            # Build request
-            request = {
-                "inspectionUrl": page_url,
-                "siteUrl": site_url
-            }
+        await INSPECTION_SEMAPHORE.acquire()
+        try:
+            service = get_gsc_service()
+            site_url = _resolve_site_url(service, site_url)
             
-            try:
-                # Execute request with retries
-                response = await _execute_with_retries(lambda: service.urlInspection().index().inspect(body=request).execute())
-                
-                if not response or "inspectionResult" not in response:
-                    results.append(f"{page_url}: No inspection data found")
-                    # Sleep between requests if configured
-                    if GSC_SLEEP_BETWEEN_REQUESTS_MS > 0:
-                        await asyncio.sleep(GSC_SLEEP_BETWEEN_REQUESTS_MS / 1000.0)
-                    continue
-                
-                inspection = response["inspectionResult"]
-                index_status = inspection.get("indexStatusResult", {})
-                
-                # Get key information
-                verdict = index_status.get("verdict", "UNKNOWN")
-                coverage = index_status.get("coverageState", "Unknown")
-                last_crawl = "Never"
-                
-                if "lastCrawlTime" in index_status:
-                    try:
-                        crawl_time = datetime.fromisoformat(index_status["lastCrawlTime"].replace('Z', '+00:00'))
-                        last_crawl = crawl_time.strftime('%Y-%m-%d')
-                    except:
-                        last_crawl = index_status["lastCrawlTime"]
-                
-                # Check for rich results
-                rich_results = "None"
-                if "richResultsResult" in inspection:
-                    rich = inspection["richResultsResult"]
-                    if rich.get("verdict") == "PASS" and "detectedItems" in rich and rich["detectedItems"]:
-                        rich_types = [item.get("richResultType", "Unknown") for item in rich["detectedItems"]]
-                        rich_results = ", ".join(rich_types)
-                
-                # Format result
-                results.append(f"{page_url}:\n  Status: {verdict} - {coverage}\n  Last Crawl: {last_crawl}\n  Rich Results: {rich_results}\n")
+            # Parse URLs
+            url_list = [url.strip() for url in urls.split('\n') if url.strip()]
             
-            except Exception as e:
-                results.append(f"{page_url}: Error - {str(e)}")
+            if not url_list:
+                return "No URLs provided for inspection."
             
-            # Sleep between requests if configured
-            if GSC_SLEEP_BETWEEN_REQUESTS_MS > 0:
-                await asyncio.sleep(GSC_SLEEP_BETWEEN_REQUESTS_MS / 1000.0)
-        
-        # Combine results
-        return f"Batch URL Inspection Results for {site_url}:\n\n" + "\n".join(results)
+            if len(url_list) > 10:
+                return f"Too many URLs provided ({len(url_list)}). Please limit to 10 URLs per batch to avoid API quota issues."
+            
+            # Process each URL
+            results = []
+            
+            for page_url in url_list:
+                # Build request
+                request = {
+                    "inspectionUrl": page_url,
+                    "siteUrl": site_url
+                }
+                
+                try:
+                    # Execute request with retries
+                    response = await _execute_with_retries(lambda: service.urlInspection().index().inspect(body=request).execute())
+                    
+                    if not response or "inspectionResult" not in response:
+                        results.append(f"{page_url}: No inspection data found")
+                        # Sleep between requests if configured
+                        if GSC_SLEEP_BETWEEN_REQUESTS_MS > 0:
+                            await asyncio.sleep(GSC_SLEEP_BETWEEN_REQUESTS_MS / 1000.0)
+                        continue
+                    
+                    inspection = response["inspectionResult"]
+                    index_status = inspection.get("indexStatusResult", {})
+                    
+                    # Get key information
+                    verdict = index_status.get("verdict", "UNKNOWN")
+                    coverage = index_status.get("coverageState", "Unknown")
+                    last_crawl = "Never"
+                    
+                    if "lastCrawlTime" in index_status:
+                        try:
+                            crawl_time = datetime.fromisoformat(index_status["lastCrawlTime"].replace('Z', '+00:00'))
+                            last_crawl = crawl_time.strftime('%Y-%m-%d')
+                        except:
+                            last_crawl = index_status["lastCrawlTime"]
+                    
+                    # Check for rich results
+                    rich_results = "None"
+                    if "richResultsResult" in inspection:
+                        rich = inspection["richResultsResult"]
+                        if rich.get("verdict") == "PASS" and "detectedItems" in rich and rich["detectedItems"]:
+                            rich_types = [item.get("richResultType", "Unknown") for item in rich["detectedItems"]]
+                            rich_results = ", ".join(rich_types)
+                    
+                    # Format result
+                    results.append(f"{page_url}:\n  Status: {verdict} - {coverage}\n  Last Crawl: {last_crawl}\n  Rich Results: {rich_results}\n")
+                
+                except Exception as e:
+                    results.append(f"{page_url}: Error - {str(e)}")
+                
+                # Sleep between requests if configured
+                if GSC_SLEEP_BETWEEN_REQUESTS_MS > 0:
+                    await asyncio.sleep(GSC_SLEEP_BETWEEN_REQUESTS_MS / 1000.0)
+            
+            # Combine results
+            return f"Batch URL Inspection Results for {site_url}:\n\n" + "\n".join(results)
+        finally:
+            INSPECTION_SEMAPHORE.release()
     
     except Exception as e:
         return f"Error performing batch inspection: {str(e)}"
@@ -792,100 +814,221 @@ async def check_indexing_issues(site_url: str, urls: str) -> str:
         urls: List of URLs to check, one per line
     """
     try:
-        service = get_gsc_service()
-        site_url = _resolve_site_url(service, site_url)
-        
-        # Parse URLs
-        url_list = [url.strip() for url in urls.split('\n') if url.strip()]
-        
-        if not url_list:
-            return "No URLs provided for inspection."
-        
-        if len(url_list) > 10:
-            return f"Too many URLs provided ({len(url_list)}). Please limit to 10 URLs per batch to avoid API quota issues."
-        
-        # Track issues by category
-        issues_summary = {
-            "not_indexed": [],
-            "canonical_issues": [],
-            "robots_blocked": [],
-            "fetch_issues": [],
-            "indexed": []
-        }
-        
-        # Process each URL
-        for page_url in url_list:
-            # Build request
-            request = {
-                "inspectionUrl": page_url,
-                "siteUrl": site_url
+        await INSPECTION_SEMAPHORE.acquire()
+        try:
+            service = get_gsc_service()
+            site_url = _resolve_site_url(service, site_url)
+            
+            # Parse URLs
+            url_list = [url.strip() for url in urls.split('\n') if url.strip()]
+            
+            if not url_list:
+                return "No URLs provided for inspection."
+            
+            if len(url_list) > 10:
+                return f"Too many URLs provided ({len(url_list)}). Please limit to 10 URLs per batch to avoid API quota issues."
+            
+            # Track issues by category
+            issues_summary = {
+                "not_indexed": [],
+                "canonical_issues": [],
+                "robots_blocked": [],
+                "fetch_issues": [],
+                "indexed": []
             }
             
-            try:
-                # Execute request
-                response = await _execute_with_retries(lambda: service.urlInspection().index().inspect(body=request).execute())
+            # Process each URL
+            for page_url in url_list:
+                # Build request
+                request = {
+                    "inspectionUrl": page_url,
+                    "siteUrl": site_url
+                }
                 
-                if not response or "inspectionResult" not in response:
-                    issues_summary["not_indexed"].append(f"{page_url} - No inspection data found")
-                    if GSC_SLEEP_BETWEEN_REQUESTS_MS > 0:
-                        await asyncio.sleep(GSC_SLEEP_BETWEEN_REQUESTS_MS / 1000.0)
-                    continue
+                try:
+                    # Execute request
+                    response = await _execute_with_retries(lambda: service.urlInspection().index().inspect(body=request).execute())
+                    
+                    if not response or "inspectionResult" not in response:
+                        issues_summary["not_indexed"].append(f"{page_url} - No inspection data found")
+                        if GSC_SLEEP_BETWEEN_REQUESTS_MS > 0:
+                            await asyncio.sleep(GSC_SLEEP_BETWEEN_REQUESTS_MS / 1000.0)
+                        continue
+                    
+                    inspection = response["inspectionResult"]
+                    index_status = inspection.get("indexStatusResult", {})
+                    
+                    # Check indexing status
+                    verdict = index_status.get("verdict", "UNKNOWN")
+                    coverage = index_status.get("coverageState", "Unknown")
+                    
+                    if verdict != "PASS" or "not indexed" in coverage.lower() or "excluded" in coverage.lower():
+                        issues_summary["not_indexed"].append(f"{page_url} - {verdict} ({coverage})")
+                    else:
+                        issues_summary["indexed"].append(f"{page_url} - {verdict} ({coverage})")
+                    
+                    # Check canonical issues
+                    google_canonical = index_status.get("googleCanonical")
+                    user_canonical = index_status.get("userCanonical")
+                    if user_canonical and google_canonical and user_canonical != google_canonical:
+                        issues_summary["canonical_issues"].append(f"{page_url} - User: {user_canonical}, Google: {google_canonical}")
+                    
+                    # Check robots.txt issues
+                    robots_state = index_status.get("robotsTxtState", "").lower()
+                    if "blocked" in robots_state:
+                        issues_summary["robots_blocked"].append(f"{page_url} - Robots: {index_status.get('robotsTxtState', 'Unknown')}")
+                    
+                    # Check fetch issues
+                    fetch_state = index_status.get("pageFetchState", "").lower()
+                    if fetch_state and fetch_state not in ("ok", "success"):
+                        issues_summary["fetch_issues"].append(f"{page_url} - Fetch: {index_status.get('pageFetchState', 'Unknown')}")
                 
-                inspection = response["inspectionResult"]
-                index_status = inspection.get("indexStatusResult", {})
+                except Exception as e:
+                    issues_summary["fetch_issues"].append(f"{page_url} - Error: {str(e)}")
                 
-                # Check indexing status
-                verdict = index_status.get("verdict", "UNKNOWN")
-                coverage = index_status.get("coverageState", "Unknown")
-                
-                if verdict != "PASS" or "not indexed" in coverage.lower() or "excluded" in coverage.lower():
-                    issues_summary["not_indexed"].append(f"{page_url} - {verdict} ({coverage})")
+                if GSC_SLEEP_BETWEEN_REQUESTS_MS > 0:
+                    await asyncio.sleep(GSC_SLEEP_BETWEEN_REQUESTS_MS / 1000.0)
+            
+            # Format summary
+            result_lines = [f"Indexing Issues Summary for {site_url}:"]
+            result_lines.append("-" * 60)
+            
+            def _format_section(title: str, items: List[str]):
+                result_lines.append(f"\n{title} ({len(items)}):")
+                if not items:
+                    result_lines.append("  - None")
                 else:
-                    issues_summary["indexed"].append(f"{page_url} - {verdict} ({coverage})")
-                
-                # Check canonical issues
-                google_canonical = index_status.get("googleCanonical")
-                user_canonical = index_status.get("userCanonical")
-                if user_canonical and google_canonical and user_canonical != google_canonical:
-                    issues_summary["canonical_issues"].append(f"{page_url} - User: {user_canonical}, Google: {google_canonical}")
-                
-                # Check robots.txt issues
-                robots_state = index_status.get("robotsTxtState", "").lower()
-                if "blocked" in robots_state:
-                    issues_summary["robots_blocked"].append(f"{page_url} - Robots: {index_status.get('robotsTxtState', 'Unknown')}")
-                
-                # Check fetch issues
-                fetch_state = index_status.get("pageFetchState", "").lower()
-                if fetch_state and fetch_state not in ("ok", "success"):
-                    issues_summary["fetch_issues"].append(f"{page_url} - Fetch: {index_status.get('pageFetchState', 'Unknown')}")
+                    for item in items:
+                        result_lines.append(f"  - {item}")
             
-            except Exception as e:
-                issues_summary["fetch_issues"].append(f"{page_url} - Error: {str(e)}")
+            _format_section("Indexed", issues_summary["indexed"])
+            _format_section("Not Indexed / Excluded", issues_summary["not_indexed"])
+            _format_section("Canonical Issues", issues_summary["canonical_issues"])
+            _format_section("Robots Blocked", issues_summary["robots_blocked"])
+            _format_section("Fetch Issues / Errors", issues_summary["fetch_issues"])
             
-            if GSC_SLEEP_BETWEEN_REQUESTS_MS > 0:
-                await asyncio.sleep(GSC_SLEEP_BETWEEN_REQUESTS_MS / 1000.0)
-        
-        # Format summary
-        result_lines = [f"Indexing Issues Summary for {site_url}:"]
-        result_lines.append("-" * 60)
-        
-        def _format_section(title: str, items: List[str]):
-            result_lines.append(f"\n{title} ({len(items)}):")
-            if not items:
-                result_lines.append("  - None")
-            else:
-                for item in items:
-                    result_lines.append(f"  - {item}")
-        
-        _format_section("Indexed", issues_summary["indexed"])
-        _format_section("Not Indexed / Excluded", issues_summary["not_indexed"])
-        _format_section("Canonical Issues", issues_summary["canonical_issues"])
-        _format_section("Robots Blocked", issues_summary["robots_blocked"])
-        _format_section("Fetch Issues / Errors", issues_summary["fetch_issues"])
-        
-        return "\n".join(result_lines)
+            return "\n".join(result_lines)
+        finally:
+            INSPECTION_SEMAPHORE.release()
     except Exception as e:
         return f"Error checking indexing issues: {str(e)}"
+
+@mcp.tool()
+async def get_top_pages_with_indexing(site_url: str, days: int = 28, limit: int = 10, batch_size: int = 3) -> str:
+    """
+    Fetch top pages by clicks and inspect their indexing status in one controlled call.
+    This avoids client-side parallel tool calls and respects server pacing.
+    
+    Args:
+        site_url: GSC property (exact match or sc-domain:example.com)
+        days: Lookback window (default 28)
+        limit: Number of top pages to include (default 10)
+        batch_size: Number of URLs to process between short pauses (default 3)
+    """
+    try:
+        await INSPECTION_SEMAPHORE.acquire()
+        try:
+            service = get_gsc_service()
+            site_url = _resolve_site_url(service, site_url)
+            end_date = datetime.now().date()
+            start_date = end_date - timedelta(days=days)
+            # Get top pages
+            req = {
+                "startDate": start_date.strftime("%Y-%m-%d"),
+                "endDate": end_date.strftime("%Y-%m-%d"),
+                "dimensions": ["page"],
+                "rowLimit": int(limit),
+                "startRow": 0,
+                "aggregationType": "auto",
+            }
+            sa = service.searchanalytics().query(siteUrl=site_url, body=req).execute()
+            rows = sa.get("rows", [])
+            if not rows:
+                return f"No search analytics data found for {site_url} in the last {days} days."
+            pages: List[Dict[str, Any]] = []
+            for r in rows:
+                keys = r.get("keys", [])
+                if not keys:
+                    continue
+                page = keys[0]
+                pages.append({
+                    "url": page,
+                    "clicks": r.get("clicks", 0),
+                    "impressions": r.get("impressions", 0),
+                    "ctr": r.get("ctr", 0.0),
+                    "position": r.get("position", 0.0),
+                })
+            # Inspect
+            results = []
+            processed_in_batch = 0
+            for p in pages:
+                request = {"inspectionUrl": p["url"], "siteUrl": site_url}
+                try:
+                    resp = await _execute_with_retries(lambda: service.urlInspection().index().inspect(body=request).execute())
+                    insp = resp.get("inspectionResult", {})
+                    idx = insp.get("indexStatusResult", {})
+                    verdict = idx.get("verdict", "UNKNOWN")
+                    coverage = idx.get("coverageState", "Unknown")
+                    last_crawl = idx.get("lastCrawlTime", "")
+                    if last_crawl:
+                        try:
+                            last_crawl = datetime.fromisoformat(last_crawl.replace('Z', '+00:00')).strftime('%Y-%m-%d')
+                        except:
+                            pass
+                    robots = idx.get("robotsTxtState", "")
+                    gcanon = idx.get("googleCanonical", "")
+                    ucanon = idx.get("userCanonical", "")
+                    rich = insp.get("richResultsResult", {})
+                    rich_status = rich.get("verdict", "UNKNOWN")
+                    rich_types = []
+                    for it in rich.get("detectedItems", []) or []:
+                        t = it.get("richResultType")
+                        if t:
+                            rich_types.append(t)
+                    results.append({
+                        **p,
+                        "index_verdict": verdict,
+                        "coverage": coverage,
+                        "last_crawl": last_crawl or "",
+                        "google_canonical": gcanon,
+                        "user_canonical": ucanon,
+                        "robots": robots,
+                        "rich": (", ".join(rich_types) if rich_types else (rich_status if rich_status != "UNKNOWN" else "None")),
+                    })
+                except Exception as e:
+                    results.append({**p, "index_verdict": f"Error: {str(e)}", "coverage": "", "last_crawl": "", "google_canonical": "", "user_canonical": "", "robots": "", "rich": ""})
+                # pacing
+                processed_in_batch += 1
+                if processed_in_batch >= max(1, int(batch_size)):
+                    processed_in_batch = 0
+                    if GSC_SLEEP_BETWEEN_REQUESTS_MS > 0:
+                        await asyncio.sleep(GSC_SLEEP_BETWEEN_REQUESTS_MS / 1000.0)
+            # Format table-like output
+            out = [f"Top {len(results)} pages for {site_url} (last {days} days) with indexing status:"]
+            header = [
+                "URL", "Clicks", "Impr.", "CTR", "Pos.", "Index", "Coverage", "LastCrawl", "G-Canonical", "U-Canonical", "Robots", "Rich"
+            ]
+            out.append("\t".join(header))
+            for r in results:
+                out.append("\t".join([
+                    r.get("url", ""),
+                    str(r.get("clicks", 0)),
+                    str(r.get("impressions", 0)),
+                    f"{float(r.get('ctr', 0.0)) * 100:.2f}%",
+                    f"{float(r.get('position', 0.0)):.1f}",
+                    r.get("index_verdict", ""),
+                    r.get("coverage", ""),
+                    r.get("last_crawl", ""),
+                    r.get("google_canonical", ""),
+                    r.get("user_canonical", ""),
+                    r.get("robots", ""),
+                    r.get("rich", ""),
+                ]))
+            return "\n".join(out)
+        finally:
+            INSPECTION_SEMAPHORE.release()
+    except Exception as e:
+        return f"Error building top pages indexing report: {str(e)}"
 
 @mcp.tool()
 async def get_performance_overview(site_url: str, days: int = 28) -> str:
