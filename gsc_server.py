@@ -10,6 +10,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from urllib.parse import urlparse
 
 # MCP
 from mcp.server.fastmcp import FastMCP
@@ -52,6 +53,97 @@ def _load_oauth_credentials_if_any():
             data = json.load(f)
         return Credentials.from_authorized_user_info(data, scopes=SCOPES)
     return None
+
+# --- Property resolution helpers ---
+
+def _list_property_urls(service) -> List[str]:
+    try:
+        site_list = service.sites().list().execute()
+        return [entry.get("siteUrl", "") for entry in site_list.get("siteEntry", [])]
+    except Exception:
+        return []
+
+
+def _normalize_domain(value: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        return value
+    # If URL, extract hostname
+    if value.startswith("http://") or value.startswith("https://"):
+        try:
+            parsed = urlparse(value)
+            return (parsed.hostname or value).lower()
+        except Exception:
+            return value.lower()
+    # If sc-domain: keep only the domain portion
+    if value.startswith("sc-domain:"):
+        return value.split(":", 1)[1].lower()
+    # Otherwise treat as hostname/domain
+    return value.lower()
+
+
+def _ensure_trailing_slash(url: str) -> str:
+    if url and url.startswith("http") and not url.endswith("/"):
+        return url + "/"
+    return url
+
+
+def _resolve_site_url(service, provided: str) -> str:
+    """
+    Resolve a user-provided identifier (bare domain, hostname, URL, or sc-domain) to an
+    actual Search Console property URL present in the user's properties.
+    Prefers domain property when available; otherwise matches URL properties by candidates or longest prefix.
+    """
+    if not provided:
+        return provided
+
+    provided = provided.strip()
+    available = _list_property_urls(service)
+    available_set = set(available)
+
+    # Quick exact matches (handle missing trailing slash for URL props)
+    if provided in available_set:
+        return provided
+    if (provided.startswith("http://") or provided.startswith("https://")):
+        with_slash = _ensure_trailing_slash(provided)
+        if with_slash in available_set:
+            return with_slash
+
+    # If already sc-domain but not exact, try normalized domain
+    if provided.startswith("sc-domain:"):
+        dom = _normalize_domain(provided)
+        candidates = [f"sc-domain:{dom}", f"sc-domain:{dom.lstrip('www.')}" ]
+        for c in candidates:
+            if c in available_set:
+                return c
+
+    # Otherwise build candidates from domain/hostname
+    dom = _normalize_domain(provided)
+    dom_nowww = dom.lstrip("www.")
+    candidates = [
+        f"sc-domain:{dom_nowww}",
+        f"sc-domain:{dom}",
+        f"https://{dom}/",
+        f"https://www.{dom_nowww}/",
+        f"http://{dom}/",
+        f"http://www.{dom_nowww}/",
+    ]
+    for c in candidates:
+        if c in available_set:
+            return c
+
+    # If provided looks like a URL, choose the longest property that is a prefix of it
+    if provided.startswith("http://") or provided.startswith("https://"):
+        provided_url = _ensure_trailing_slash(provided)
+        best = ""
+        for prop in available:
+            if prop and provided_url.startswith(prop) and len(prop) > len(best):
+                best = prop
+        if best:
+            return best
+
+    # Fallback to provided (let API error if invalid)
+    return provided
 
 def get_gsc_service():
     """
@@ -281,6 +373,7 @@ async def get_search_analytics(site_url: str, days: int = 28, dimensions: str = 
     """
     try:
         service = get_gsc_service()
+        site_url = _resolve_site_url(service, site_url)
         
         # Calculate date range
         end_date = datetime.now().date()
@@ -344,6 +437,7 @@ async def get_site_details(site_url: str) -> str:
     """
     try:
         service = get_gsc_service()
+        site_url = _resolve_site_url(service, site_url)
         
         # Get site details
         site_info = service.sites().get(siteUrl=site_url).execute()
@@ -389,6 +483,7 @@ async def get_sitemaps(site_url: str) -> str:
     """
     try:
         service = get_gsc_service()
+        site_url = _resolve_site_url(service, site_url)
         
         # Get sitemaps list
         sitemaps = service.sitemaps().list(siteUrl=site_url).execute()
@@ -762,6 +857,7 @@ async def get_performance_overview(site_url: str, days: int = 28) -> str:
     """
     try:
         service = get_gsc_service()
+        site_url = _resolve_site_url(service, site_url)
         
         # Calculate date range
         end_date = datetime.now().date()
@@ -1111,6 +1207,7 @@ async def get_search_by_page_query(
     """
     try:
         service = get_gsc_service()
+        site_url = _resolve_site_url(service, site_url)
         
         # Calculate date range
         end_date = datetime.now().date()
@@ -1179,6 +1276,7 @@ async def list_sitemaps_enhanced(site_url: str, sitemap_index: str = None) -> st
     """
     try:
         service = get_gsc_service()
+        site_url = _resolve_site_url(service, site_url)
         
         # Get sitemaps list
         if sitemap_index:
@@ -1257,6 +1355,7 @@ async def get_sitemap_details(site_url: str, sitemap_url: str) -> str:
     """
     try:
         service = get_gsc_service()
+        site_url = _resolve_site_url(service, site_url)
         
         # Get sitemap details
         details = service.sitemaps().get(siteUrl=site_url, feedpath=sitemap_url).execute()
@@ -1325,6 +1424,7 @@ async def submit_sitemap(site_url: str, sitemap_url: str) -> str:
     """
     try:
         service = get_gsc_service()
+        site_url = _resolve_site_url(service, site_url)
         
         # Submit the sitemap
         service.sitemaps().submit(siteUrl=site_url, feedpath=sitemap_url).execute()
@@ -1370,6 +1470,7 @@ async def delete_sitemap(site_url: str, sitemap_url: str) -> str:
     """
     try:
         service = get_gsc_service()
+        site_url = _resolve_site_url(service, site_url)
         
         # First check if the sitemap exists
         try:
