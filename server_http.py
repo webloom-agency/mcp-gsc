@@ -54,7 +54,7 @@ async def oauth_start(request: Request):
         flow = _flow()
         auth_url, state = flow.authorization_url(
             access_type="offline",
-            include_granted_scopes="true",
+            include_granted_scopes=False,  # avoid inheriting previous app scopes (prevents scope mismatch)
             prompt="consent",
         )
         # you can store state in signed cookies/session if desired; for simplicity we skip it here
