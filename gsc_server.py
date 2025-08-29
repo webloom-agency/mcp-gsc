@@ -421,7 +421,7 @@ async def delete_site(site_url: str) -> str:
         return f"Error removing site: {str(e)}"
 
 @mcp.tool()
-async def get_search_analytics(site_url: str, days: int = 28, dimensions: str = "query") -> str:
+async def get_search_analytics(site_url: str, days: int = 28, dimensions: str = "query", row_limit: int = 1000, start_row: int = 0) -> str:
     """
     Get search analytics data for a specific property.
     
@@ -430,6 +430,8 @@ async def get_search_analytics(site_url: str, days: int = 28, dimensions: str = 
         days: Number of days to look back (default: 28)
         dimensions: Dimensions to group by (default: query). Options: query, page, device, country, date
                    You can provide multiple dimensions separated by comma (e.g., "query,page")
+        row_limit: Max rows to return (default 1000, API max 25000)
+        start_row: Starting row for pagination (default 0)
     """
     try:
         service = get_gsc_service()
@@ -447,13 +449,15 @@ async def get_search_analytics(site_url: str, days: int = 28, dimensions: str = 
             "startDate": start_date.strftime("%Y-%m-%d"),
             "endDate": end_date.strftime("%Y-%m-%d"),
             "dimensions": dimension_list,
-            "rowLimit": 20  # Limit to top 20 results
+            "rowLimit": min(int(row_limit), 25000),
+            "startRow": int(start_row),
         }
         
         # Execute request
         response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
+        rows = response.get("rows", [])
         
-        if not response.get("rows"):
+        if not rows:
             return f"No search analytics data found for {site_url} in the last {days} days."
         
         # Format results
@@ -469,11 +473,11 @@ async def get_search_analytics(site_url: str, days: int = 28, dimensions: str = 
         result_lines.append("-" * 80)
         
         # Add data rows
-        for row in response.get("rows", []):
+        for row in rows:
             data = []
             # Add dimension values
             for dim_value in row.get("keys", []):
-                data.append(dim_value[:100])  # Increased truncation limit to 100 characters
+                data.append(dim_value[:100])  # Truncate long values for readability
             
             # Add metrics
             data.append(str(row.get("clicks", 0)))
@@ -482,6 +486,13 @@ async def get_search_analytics(site_url: str, days: int = 28, dimensions: str = 
             data.append(f"{row.get('position', 0):.1f}")
             
             result_lines.append(" | ".join(data))
+        
+        # Pagination hint
+        shown = len(rows)
+        if shown == min(int(row_limit), 25000):
+            next_start = int(start_row) + shown
+            result_lines.append("\nThere may be more results. To fetch next page, call with:")
+            result_lines.append(f"start_row: {next_start}, row_limit: {row_limit}")
         
         return "\n".join(result_lines)
     except Exception as e:
