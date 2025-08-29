@@ -421,7 +421,7 @@ async def delete_site(site_url: str) -> str:
         return f"Error removing site: {str(e)}"
 
 @mcp.tool()
-async def get_search_analytics(site_url: str, days: int = 28, dimensions: str = "query", row_limit: int = 1000, start_row: int = 0) -> str:
+async def get_search_analytics(site_url: str, days: int = 28, dimensions: str = "query", row_limit: int = 1000, start_row: int = 0, auto_paginate: Optional[bool] = None) -> str:
     """
     Get search analytics data for a specific property.
     
@@ -432,6 +432,7 @@ async def get_search_analytics(site_url: str, days: int = 28, dimensions: str = 
                    You can provide multiple dimensions separated by comma (e.g., "query,page")
         row_limit: Max rows to return (default 1000, API max 25000)
         start_row: Starting row for pagination (default 0)
+        auto_paginate: If true, fetches all pages up to the global max. Defaults to env GSC_AUTO_PAGINATE_DEFAULT.
     """
     try:
         service = get_gsc_service()
@@ -453,9 +454,13 @@ async def get_search_analytics(site_url: str, days: int = 28, dimensions: str = 
             "startRow": int(start_row),
         }
         
-        # Execute request
-        response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
-        rows = response.get("rows", [])
+        # Execute request (optionally auto-paginate)
+        effective_auto = GSC_AUTO_PAGINATE_DEFAULT if auto_paginate is None else bool(auto_paginate)
+        if effective_auto:
+            rows = await _sa_query_all(service, site_url, request, GSC_AUTO_PAGINATE_MAX_ROWS)
+        else:
+            response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
+            rows = response.get("rows", [])
         
         if not rows:
             return f"No search analytics data found for {site_url} in the last {days} days."
@@ -487,12 +492,13 @@ async def get_search_analytics(site_url: str, days: int = 28, dimensions: str = 
             
             result_lines.append(" | ".join(data))
         
-        # Pagination hint
-        shown = len(rows)
-        if shown == min(int(row_limit), 25000):
-            next_start = int(start_row) + shown
-            result_lines.append("\nThere may be more results. To fetch next page, call with:")
-            result_lines.append(f"start_row: {next_start}, row_limit: {row_limit}")
+        # Pagination hint only if not auto-paginating
+        if not effective_auto:
+            shown = len(rows)
+            if shown == min(int(row_limit), 25000):
+                next_start = int(start_row) + shown
+                result_lines.append("\nThere may be more results. To fetch next page, call with:")
+                result_lines.append(f"start_row: {next_start}, row_limit: {row_limit}")
         
         return "\n".join(result_lines)
     except Exception as e:
@@ -1135,7 +1141,8 @@ async def get_advanced_search_analytics(
     sort_direction: str = "descending",
     filter_dimension: str = None,
     filter_operator: str = "contains", 
-    filter_expression: str = None
+    filter_expression: str = None,
+    auto_paginate: Optional[bool] = None,
 ) -> str:
     """
     Get advanced search analytics data with sorting, filtering, and pagination.
@@ -1153,6 +1160,7 @@ async def get_advanced_search_analytics(
         filter_dimension: Dimension to filter on (query, page, country, device)
         filter_operator: Filter operator (contains, equals, notContains, notEquals)
         filter_expression: Filter expression value
+        auto_paginate: If true, fetches all pages up to the global max. Defaults to env GSC_AUTO_PAGINATE_DEFAULT.
     """
     try:
         service = get_gsc_service()
@@ -1203,10 +1211,15 @@ async def get_advanced_search_analytics(
             }
             request["dimensionFilterGroups"] = [filter_group]
         
-        # Execute request
-        response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
+        # Execute request (optionally auto-paginate)
+        effective_auto = GSC_AUTO_PAGINATE_DEFAULT if auto_paginate is None else bool(auto_paginate)
+        if effective_auto:
+            rows = await _sa_query_all(service, site_url, request, GSC_AUTO_PAGINATE_MAX_ROWS)
+        else:
+            response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
+            rows = response.get("rows", [])
         
-        if not response.get("rows"):
+        if not rows:
             return (f"No search analytics data found for {site_url} with the specified parameters.\n\n"
                    f"Parameters used:\n"
                    f"- Date range: {start_date} to {end_date}\n"
@@ -1220,7 +1233,10 @@ async def get_advanced_search_analytics(
         result_lines.append(f"Search type: {search_type}")
         if filter_dimension:
             result_lines.append(f"Filter: {filter_dimension} {filter_operator} '{filter_expression}'")
-        result_lines.append(f"Showing rows {start_row+1} to {start_row+len(response.get('rows', []))} (sorted by {sort_by} {sort_direction})")
+        if effective_auto:
+            result_lines.append(f"Showing all {len(rows)} rows (sorted by {sort_by} {sort_direction})")
+        else:
+            result_lines.append(f"Showing rows {start_row+1} to {start_row+len(rows)} (sorted by {sort_by} {sort_direction})")
         result_lines.append("\n" + "-" * 80 + "\n")
         
         # Create header based on dimensions
@@ -1232,7 +1248,7 @@ async def get_advanced_search_analytics(
         result_lines.append("-" * 80)
         
         # Add data rows
-        for row in response.get("rows", []):
+        for row in rows:
             data = []
             # Add dimension values
             for dim_value in row.get("keys", []):
@@ -1247,7 +1263,7 @@ async def get_advanced_search_analytics(
             result_lines.append(" | ".join(data))
         
         # Add pagination info if there might be more results
-        if len(response.get("rows", [])) == row_limit:
+        if not effective_auto and len(rows) == row_limit:
             next_start = start_row + row_limit
             result_lines.append("\nThere may be more results available. To see the next page, use:")
             result_lines.append(f"start_row: {next_start}, row_limit: {row_limit}")
@@ -1264,7 +1280,8 @@ async def compare_search_periods(
     period2_start: str,
     period2_end: str,
     dimensions: str = "query",
-    limit: int = 10
+    limit: int = 10,
+    auto_paginate: Optional[bool] = None,
 ) -> str:
     """
     Compare search analytics data between two time periods.
@@ -1277,6 +1294,7 @@ async def compare_search_periods(
         period2_end: End date for period 2 (YYYY-MM-DD)
         dimensions: Dimensions to group by (default: query)
         limit: Number of top results to compare (default: 10)
+        auto_paginate: If true, fetches all pages up to the global max. Defaults to env GSC_AUTO_PAGINATE_DEFAULT.
     """
     try:
         service = get_gsc_service()
@@ -1290,7 +1308,7 @@ async def compare_search_periods(
             "startDate": period1_start,
             "endDate": period1_end,
             "dimensions": dimension_list,
-            "rowLimit": 1000  # Get more to ensure we can match items between periods
+            "rowLimit": 1000  # Default page size if not auto-paginating
         }
         
         period2_request = {
@@ -1300,91 +1318,66 @@ async def compare_search_periods(
             "rowLimit": 1000
         }
         
-        # Execute requests
-        period1_response = service.searchanalytics().query(siteUrl=site_url, body=period1_request).execute()
-        period2_response = service.searchanalytics().query(siteUrl=site_url, body=period2_request).execute()
-        
-        period1_rows = period1_response.get("rows", [])
-        period2_rows = period2_response.get("rows", [])
+        # Execute requests (optionally auto-paginate)
+        effective_auto = GSC_AUTO_PAGINATE_DEFAULT if auto_paginate is None else bool(auto_paginate)
+        if effective_auto:
+            period1_rows = await _sa_query_all(service, site_url, period1_request, GSC_AUTO_PAGINATE_MAX_ROWS)
+            period2_rows = await _sa_query_all(service, site_url, period2_request, GSC_AUTO_PAGINATE_MAX_ROWS)
+        else:
+            period1_response = service.searchanalytics().query(siteUrl=site_url, body=period1_request).execute()
+            period2_response = service.searchanalytics().query(siteUrl=site_url, body=period2_request).execute()
+            period1_rows = period1_response.get("rows", [])
+            period2_rows = period2_response.get("rows", [])
         
         if not period1_rows and not period2_rows:
             return f"No data found for either period for {site_url}."
         
-        # Create dictionaries for easy lookup
-        period1_data = {tuple(row.get("keys", [])): row for row in period1_rows}
-        period2_data = {tuple(row.get("keys", [])): row for row in period2_rows}
+        # Aggregate by keys for comparison
+        def to_key(row):
+            return tuple(row.get("keys", []))
         
-        # Find common keys and calculate differences
-        all_keys = set(period1_data.keys()) | set(period2_data.keys())
-        comparison_data = []
+        p1_map: Dict[Any, Dict[str, Any]] = {to_key(r): r for r in period1_rows}
+        p2_map: Dict[Any, Dict[str, Any]] = {to_key(r): r for r in period2_rows}
         
-        for key in all_keys:
-            p1_row = period1_data.get(key, {"clicks": 0, "impressions": 0, "ctr": 0, "position": 0})
-            p2_row = period2_data.get(key, {"clicks": 0, "impressions": 0, "ctr": 0, "position": 0})
-            
-            # Calculate differences
-            click_diff = p2_row.get("clicks", 0) - p1_row.get("clicks", 0)
-            click_pct = (click_diff / p1_row.get("clicks", 1)) * 100 if p1_row.get("clicks", 0) > 0 else float('inf')
-            
-            imp_diff = p2_row.get("impressions", 0) - p1_row.get("impressions", 0)
-            imp_pct = (imp_diff / p1_row.get("impressions", 1)) * 100 if p1_row.get("impressions", 0) > 0 else float('inf')
-            
-            ctr_diff = p2_row.get("ctr", 0) - p1_row.get("ctr", 0)
-            pos_diff = p1_row.get("position", 0) - p2_row.get("position", 0)  # Note: lower position is better
-            
-            comparison_data.append({
-                "key": key,
-                "p1_clicks": p1_row.get("clicks", 0),
-                "p2_clicks": p2_row.get("clicks", 0),
-                "click_diff": click_diff,
-                "click_pct": click_pct,
-                "p1_impressions": p1_row.get("impressions", 0),
-                "p2_impressions": p2_row.get("impressions", 0),
-                "imp_diff": imp_diff,
-                "imp_pct": imp_pct,
-                "p1_ctr": p1_row.get("ctr", 0),
-                "p2_ctr": p2_row.get("ctr", 0),
-                "ctr_diff": ctr_diff,
-                "p1_position": p1_row.get("position", 0),
-                "p2_position": p2_row.get("position", 0),
-                "pos_diff": pos_diff
-            })
+        # Compute deltas
+        all_keys = set(p1_map.keys()) | set(p2_map.keys())
+        deltas = []
+        for k in all_keys:
+            r1 = p1_map.get(k, {})
+            r2 = p2_map.get(k, {})
+            clicks_delta = float(r2.get("clicks", 0)) - float(r1.get("clicks", 0))
+            impr_delta = float(r2.get("impressions", 0)) - float(r1.get("impressions", 0))
+            ctr_delta = float(r2.get("ctr", 0)) - float(r1.get("ctr", 0))
+            pos_delta = float(r2.get("position", 0)) - float(r1.get("position", 0))
+            deltas.append((k, clicks_delta, impr_delta, ctr_delta, pos_delta, r1, r2))
         
-        # Sort by absolute click difference (can change to other metrics)
-        comparison_data.sort(key=lambda x: abs(x["click_diff"]), reverse=True)
+        # Sort by impressions delta asc (drops first)
+        deltas.sort(key=lambda x: x[2])
         
-        # Format results
-        result_lines = [f"Search analytics comparison for {site_url}:"]
-        result_lines.append(f"Period 1: {period1_start} to {period1_end}")
-        result_lines.append(f"Period 2: {period2_start} to {period2_end}")
-        result_lines.append(f"Dimension(s): {dimensions}")
-        result_lines.append(f"Top {min(limit, len(comparison_data))} results by change in clicks:")
-        result_lines.append("\n" + "-" * 100 + "\n")
-        
-        # Create header
-        dim_header = " | ".join([d.capitalize() for d in dimension_list])
-        result_lines.append(f"{dim_header} | P1 Clicks | P2 Clicks | Change | % | P1 Pos | P2 Pos | Pos Δ")
-        result_lines.append("-" * 100)
-        
-        # Add data rows (limited to requested number)
-        for item in comparison_data[:limit]:
-            key_str = " | ".join([str(k)[:100] for k in item["key"]])
-            
-            # Format the click change with color indicators
-            click_change = item["click_diff"]
-            click_pct = item["click_pct"] if item["click_pct"] != float('inf') else "N/A"
-            click_pct_str = f"{click_pct:.1f}%" if click_pct != "N/A" else "N/A"
-            
-            # Format position change (positive is good - moving up in rankings)
-            pos_change = item["pos_diff"]
-            
-            result_lines.append(
-                f"{key_str} | {item['p1_clicks']} | {item['p2_clicks']} | "
-                f"{click_change:+d} | {click_pct_str} | "
-                f"{item['p1_position']:.1f} | {item['p2_position']:.1f} | {pos_change:+.1f}"
+        # Format output
+        lines = [
+            f"Comparison for {site_url}",
+            f"Period 1: {period1_start} to {period1_end} | Period 2: {period2_start} to {period2_end}",
+            "\nKeys | ClicksΔ | ImprΔ | CTRΔ | PosΔ | P1(clicks,impr,ctr,pos) | P2(clicks,impr,ctr,pos)"
+        ]
+        count = 0
+        for k, cΔ, iΔ, ctrΔ, pΔ, r1, r2 in deltas:
+            dims = " / ".join([str(x) for x in k]) if k else "(total)"
+            lines.append(
+                " | ".join([
+                    dims,
+                    f"{cΔ:.0f}",
+                    f"{iΔ:.0f}",
+                    f"{(ctrΔ*100):.2f}%",
+                    f"{pΔ:.1f}",
+                    f"{r1.get('clicks',0):.0f},{r1.get('impressions',0):.0f},{(r1.get('ctr',0)*100):.2f}%,{r1.get('position',0):.1f}",
+                    f"{r2.get('clicks',0):.0f},{r2.get('impressions',0):.0f},{(r2.get('ctr',0)*100):.2f}%,{r2.get('position',0):.1f}",
+                ])
             )
-        
-        return "\n".join(result_lines)
+            count += 1
+            if limit and count >= int(limit):
+                break
+        return "\n".join(lines)
     except Exception as e:
         return f"Error comparing search periods: {str(e)}"
 
@@ -1753,6 +1746,151 @@ Amin has created several popular SEO tools including:
 Amin combines technical SEO knowledge with programming skills to create innovative solutions for SEO challenges.
 """
     return creator_info
+
+@mcp.tool()
+async def find_queries_dropped_week_over_week(
+    site_url: str,
+    country: str = "FRA",
+    mode: str = "calendar",  # "calendar" = last Mon-Sun vs current Mon-today; "rolling" = prev 7d vs last 7d
+    min_impressions_last_week: int = 10,
+    search_type: str = "WEB",
+    limit: int = 200,
+) -> str:
+    """
+    Find queries that had impressions last week but zero this week for a given country.
+    Auto-paginates to avoid sampling/rowLimit bias.
+
+    Args:
+        site_url: GSC property
+        country: ISO-3166-1 alpha-3 (e.g., FRA)
+        mode: "calendar" (default) compares last completed week (Mon-Sun) with current week (Mon-today);
+              "rolling" compares previous 7 days vs last 7 days.
+        min_impressions_last_week: Minimum impressions last week to include a query
+        search_type: WEB/IMAGE/VIDEO/NEWS/DISCOVER
+        limit: Max number of rows in the output
+    """
+    try:
+        service = get_gsc_service()
+        site_url = _resolve_site_url(service, site_url)
+        country = (country or "FRA").upper()
+
+        today = datetime.now().date()
+        if mode.lower() == "rolling":
+            this_week_start = today - timedelta(days=6)
+            this_week_end = today
+            last_week_end = this_week_start - timedelta(days=1)
+            last_week_start = last_week_end - timedelta(days=6)
+        else:
+            # calendar weeks (Mon-Sun)
+            iso_weekday = today.isoweekday()  # 1=Mon..7=Sun
+            this_week_start = today - timedelta(days=iso_weekday - 1)
+            this_week_end = today
+            last_week_end = this_week_start - timedelta(days=1)
+            last_week_start = last_week_end - timedelta(days=6)
+
+        async def fetch_queries(start_date: str, end_date: str) -> Dict[str, Dict[str, float]]:
+            start_row = 0
+            all_rows: Dict[str, Dict[str, float]] = {}
+            while True:
+                body = {
+                    "startDate": start_date,
+                    "endDate": end_date,
+                    "dimensions": ["query"],
+                    "rowLimit": 25000,
+                    "startRow": start_row,
+                    "searchType": search_type.upper(),
+                    "dimensionFilterGroups": [
+                        {
+                            "filters": [
+                                {
+                                    "dimension": "country",
+                                    "operator": "equals",
+                                    "expression": country,
+                                }
+                            ]
+                        }
+                    ],
+                }
+                resp = await _execute_with_retries(
+                    lambda: service.searchanalytics().query(siteUrl=site_url, body=body).execute()
+                )
+                rows = resp.get("rows", [])
+                if not rows:
+                    break
+                for r in rows:
+                    keys = r.get("keys", [])
+                    if not keys:
+                        continue
+                    q = keys[0]
+                    metrics = all_rows.get(q) or {"clicks": 0.0, "impressions": 0.0, "ctr": 0.0, "position": 0.0, "count": 0}
+                    # aggregate
+                    metrics["clicks"] += float(r.get("clicks", 0.0))
+                    metrics["impressions"] += float(r.get("impressions", 0.0))
+                    metrics["ctr"] += float(r.get("ctr", 0.0))
+                    metrics["position"] += float(r.get("position", 0.0))
+                    metrics["count"] += 1
+                    all_rows[q] = metrics
+                # paginate
+                got = len(rows)
+                start_row += got
+                if got < 25000:
+                    break
+            # average ctr/position if multiple buckets were returned (usually already aggregated)
+            for q, m in all_rows.items():
+                c = max(1, int(m.get("count", 1)))
+                m["ctr"] = m["ctr"] / c
+                m["position"] = m["position"] / c
+            return all_rows
+
+        last_start_str = last_week_start.strftime("%Y-%m-%d")
+        last_end_str = last_week_end.strftime("%Y-%m-%d")
+        this_start_str = this_week_start.strftime("%Y-%m-%d")
+        this_end_str = this_week_end.strftime("%Y-%m-%d")
+
+        last_week_data = await fetch_queries(last_start_str, last_end_str)
+        this_week_data = await fetch_queries(this_start_str, this_end_str)
+
+        this_week_queries = set(this_week_data.keys())
+        dropped = [
+            (q, m)
+            for q, m in last_week_data.items()
+            if m.get("impressions", 0.0) >= float(min_impressions_last_week) and q not in this_week_queries
+        ]
+
+        # sort by last week impressions desc
+        dropped.sort(key=lambda item: item[1].get("impressions", 0.0), reverse=True)
+        if limit and limit > 0:
+            dropped = dropped[: int(limit)]
+
+        if not dropped:
+            return (
+                f"No queries found that meet the criteria for {site_url} in {country}.\n"
+                f"Last week: {last_start_str} to {last_end_str}; This week: {this_start_str} to {this_end_str}.\n"
+                f"Threshold: impressions >= {min_impressions_last_week}."
+            )
+
+        lines = [
+            f"Queries with impressions last week but none this week for {site_url} in {country}",
+            f"Last week: {last_start_str} to {last_end_str}; This week: {this_start_str} to {this_end_str}",
+            f"Search type: {search_type.upper()} | Threshold: impressions >= {min_impressions_last_week}",
+            "",
+            "Query\tImpr LW\tClicks LW\tCTR LW\tPos LW",
+        ]
+        for q, m in dropped:
+            lines.append(
+                "\t".join(
+                    [
+                        q,
+                        f"{m.get('impressions', 0.0):.0f}",
+                        f"{m.get('clicks', 0.0):.0f}",
+                        f"{float(m.get('ctr', 0.0)) * 100:.2f}%",
+                        f"{float(m.get('position', 0.0)):.1f}",
+                    ]
+                )
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error computing dropped queries WoW: {str(e)}"
 
 if __name__ == "__main__":
     # Start the MCP server on stdio transport
