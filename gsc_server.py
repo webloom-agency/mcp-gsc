@@ -71,6 +71,10 @@ GSC_SLEEP_BETWEEN_REQUESTS_MS = _get_int_env("GSC_SLEEP_BETWEEN_REQUESTS_MS", 10
 GSC_RETRY_JITTER_MS = _get_int_env("GSC_RETRY_JITTER_MS", 300)
 GSC_MAX_CONCURRENT_INSPECTIONS = _get_int_env("GSC_MAX_CONCURRENT_INSPECTIONS", 1)
 INSPECTION_SEMAPHORE = asyncio.Semaphore(max(1, GSC_MAX_CONCURRENT_INSPECTIONS))
+GSC_AUTO_PAGINATE_DEFAULT = os.getenv("GSC_AUTO_PAGINATE_DEFAULT", "false").lower() in ("1", "true", "yes")
+GSC_AUTO_PAGINATE_MAX_ROWS = _get_int_env("GSC_AUTO_PAGINATE_MAX_ROWS", 100000)
+GSC_SA_PAGE_SIZE = _get_int_env("GSC_SA_PAGE_SIZE", 25000)
+GSC_INTERNAL_INSPECTION_CONCURRENCY = _get_int_env("GSC_INTERNAL_INSPECTION_CONCURRENCY", 2)
 
 # Prefer a pre-provisioned OAuth token on disk (e.g., saved by HTTP callback) if available
 # Default to GOOGLE_MCP_CREDENTIALS_DIR/gsc_token.json, falling back to /data/gsc_token.json
@@ -147,6 +151,27 @@ async def _execute_with_retries_cfg(
                     pass
             await asyncio.sleep(backoff + random.uniform(0, max(0, jitter) / 1000.0))
     raise last_exc
+
+async def _sa_query_all(service, site_url: str, base_body: Dict[str, Any], max_rows: Optional[int] = None) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    start_row = int(base_body.get("startRow", 0) or 0)
+    page_size = min(int(base_body.get("rowLimit", GSC_SA_PAGE_SIZE) or GSC_SA_PAGE_SIZE), 25000)
+    while True:
+        body = dict(base_body)
+        body["startRow"] = start_row
+        body["rowLimit"] = page_size
+        resp = await _execute_with_retries(lambda: service.searchanalytics().query(siteUrl=site_url, body=body).execute())
+        page_rows = resp.get("rows", [])
+        if not page_rows:
+            break
+        rows.extend(page_rows)
+        start_row += len(page_rows)
+        if len(page_rows) < page_size:
+            break
+        if max_rows is not None and len(rows) >= max_rows:
+            rows = rows[:max_rows]
+            break
+    return rows
 
 # --- Property resolution helpers ---
 
@@ -975,6 +1000,7 @@ async def get_top_pages_with_indexing(
     backoff_seconds: Optional[float] = None,
     jitter_ms: Optional[int] = None,
     max_backoff_seconds: Optional[float] = None,
+    concurrency: Optional[int] = None,
 ) -> str:
     """
     Fetch top pages by clicks and inspect their indexing status in one controlled call.
@@ -987,6 +1013,7 @@ async def get_top_pages_with_indexing(
         batch_size: Number of URLs to process between short pauses (default 3)
         per_request_sleep_ms: Override sleep between URL inspections (default from env)
         retries/backoff_seconds/jitter_ms/max_backoff_seconds: per-request retry tuning
+        concurrency: Internal concurrency for inspections (default from env, small value like 2)
     """
     try:
         await INSPECTION_SEMAPHORE.acquire()
@@ -1022,57 +1049,57 @@ async def get_top_pages_with_indexing(
                     "position": r.get("position", 0.0),
                 })
             # Inspect
-            results = []
-            processed_in_batch = 0
+            results = [None] * len(pages)
             sleep_ms = GSC_SLEEP_BETWEEN_REQUESTS_MS if per_request_sleep_ms is None else int(per_request_sleep_ms)
-            for p in pages:
-                request = {"inspectionUrl": p["url"], "siteUrl": site_url}
-                try:
-                    resp = await _execute_with_retries_cfg(
-                        lambda: service.urlInspection().index().inspect(body=request).execute(),
-                        retries=retries,
-                        base_backoff_seconds=backoff_seconds,
-                        jitter_ms=jitter_ms,
-                        max_backoff_seconds=max_backoff_seconds,
-                    )
-                    insp = resp.get("inspectionResult", {})
-                    idx = insp.get("indexStatusResult", {})
-                    verdict = idx.get("verdict", "UNKNOWN")
-                    coverage = idx.get("coverageState", "Unknown")
-                    last_crawl = idx.get("lastCrawlTime", "")
-                    if last_crawl:
-                        try:
-                            last_crawl = datetime.fromisoformat(last_crawl.replace('Z', '+00:00')).strftime('%Y-%m-%d')
-                        except:
-                            pass
-                    robots = idx.get("robotsTxtState", "")
-                    gcanon = idx.get("googleCanonical", "")
-                    ucanon = idx.get("userCanonical", "")
-                    rich = insp.get("richResultsResult", {})
-                    rich_status = rich.get("verdict", "UNKNOWN")
-                    rich_types = []
-                    for it in rich.get("detectedItems", []) or []:
-                        t = it.get("richResultType")
-                        if t:
-                            rich_types.append(t)
-                    results.append({
-                        **p,
-                        "index_verdict": verdict,
-                        "coverage": coverage,
-                        "last_crawl": last_crawl or "",
-                        "google_canonical": gcanon,
-                        "user_canonical": ucanon,
-                        "robots": robots,
-                        "rich": (", ".join(rich_types) if rich_types else (rich_status if rich_status != "UNKNOWN" else "None")),
-                    })
-                except Exception as e:
-                    results.append({**p, "index_verdict": f"Error: {str(e)}", "coverage": "", "last_crawl": "", "google_canonical": "", "user_canonical": "", "robots": "", "rich": ""})
-                # pacing
-                processed_in_batch += 1
-                if processed_in_batch >= max(1, int(batch_size)):
-                    processed_in_batch = 0
+            conc = GSC_INTERNAL_INSPECTION_CONCURRENCY if concurrency is None else max(1, int(concurrency))
+            sem = asyncio.Semaphore(conc)
+            async def inspect_one(idx: int, p: Dict[str, Any]):
+                async with sem:
+                    request = {"inspectionUrl": p["url"], "siteUrl": site_url}
+                    try:
+                        resp = await _execute_with_retries_cfg(
+                            lambda: service.urlInspection().index().inspect(body=request).execute(),
+                            retries=retries,
+                            base_backoff_seconds=backoff_seconds,
+                            jitter_ms=jitter_ms,
+                            max_backoff_seconds=max_backoff_seconds,
+                        )
+                        insp = resp.get("inspectionResult", {})
+                        idxs = insp.get("indexStatusResult", {})
+                        verdict = idxs.get("verdict", "UNKNOWN")
+                        coverage = idxs.get("coverageState", "Unknown")
+                        last_crawl = idxs.get("lastCrawlTime", "")
+                        if last_crawl:
+                            try:
+                                last_crawl = datetime.fromisoformat(last_crawl.replace('Z', '+00:00')).strftime('%Y-%m-%d')
+                            except:
+                                pass
+                        robots = idxs.get("robotsTxtState", "")
+                        gcanon = idxs.get("googleCanonical", "")
+                        ucanon = idxs.get("userCanonical", "")
+                        rich = insp.get("richResultsResult", {})
+                        rich_status = rich.get("verdict", "UNKNOWN")
+                        rich_types = []
+                        for it in rich.get("detectedItems", []) or []:
+                            t = it.get("richResultType")
+                            if t:
+                                rich_types.append(t)
+                        results[idx] = {
+                            **p,
+                            "index_verdict": verdict,
+                            "coverage": coverage,
+                            "last_crawl": last_crawl or "",
+                            "google_canonical": gcanon,
+                            "user_canonical": ucanon,
+                            "robots": robots,
+                            "rich": (", ".join(rich_types) if rich_types else (rich_status if rich_status != "UNKNOWN" else "None")),
+                        }
+                    except Exception as e:
+                        results[idx] = {**p, "index_verdict": f"Error: {str(e)}", "coverage": "", "last_crawl": "", "google_canonical": "", "user_canonical": "", "robots": "", "rich": ""}
                     if sleep_ms > 0:
                         await asyncio.sleep(sleep_ms / 1000.0)
+            tasks = [inspect_one(i, p) for i, p in enumerate(pages)]
+            await asyncio.gather(*tasks)
             # Format table-like output
             out = [f"Top {len(results)} pages for {site_url} (last {days} days) with indexing status:"]
             header = [
