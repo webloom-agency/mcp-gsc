@@ -114,6 +114,40 @@ async def _execute_with_retries(execute_callable):
             await asyncio.sleep(backoff + jitter)
     raise last_exc
 
+# Configurable retry helper
+async def _execute_with_retries_cfg(
+    execute_callable,
+    retries: Optional[int] = None,
+    base_backoff_seconds: Optional[float] = None,
+    jitter_ms: Optional[int] = None,
+    max_backoff_seconds: Optional[float] = None,
+):
+    r = GSC_REQUEST_RETRIES if retries is None else int(retries)
+    base = GSC_RETRY_BACKOFF_SECONDS if base_backoff_seconds is None else float(base_backoff_seconds)
+    jitter = GSC_RETRY_JITTER_MS if jitter_ms is None else int(jitter_ms)
+    last_exc = None
+    for attempt in range(r + 1):
+        try:
+            return await asyncio.to_thread(execute_callable)
+        except HttpError as e:
+            last_exc = e
+            status = getattr(getattr(e, "resp", None), "status", None)
+            if status in {408, 429, 500, 502, 503, 504}:
+                pass
+            else:
+                raise
+        except Exception as e:
+            last_exc = e
+        if attempt < r:
+            backoff = (base ** (attempt + 1))
+            if max_backoff_seconds is not None:
+                try:
+                    backoff = min(backoff, float(max_backoff_seconds))
+                except Exception:
+                    pass
+            await asyncio.sleep(backoff + random.uniform(0, max(0, jitter) / 1000.0))
+    raise last_exc
+
 # --- Property resolution helpers ---
 
 def _list_property_urls(service) -> List[str]:
@@ -931,7 +965,17 @@ async def check_indexing_issues(site_url: str, urls: str) -> str:
         return f"Error checking indexing issues: {str(e)}"
 
 @mcp.tool()
-async def get_top_pages_with_indexing(site_url: str, days: int = 28, limit: int = 10, batch_size: int = 3) -> str:
+async def get_top_pages_with_indexing(
+    site_url: str,
+    days: int = 28,
+    limit: int = 10,
+    batch_size: int = 3,
+    per_request_sleep_ms: Optional[int] = None,
+    retries: Optional[int] = None,
+    backoff_seconds: Optional[float] = None,
+    jitter_ms: Optional[int] = None,
+    max_backoff_seconds: Optional[float] = None,
+) -> str:
     """
     Fetch top pages by clicks and inspect their indexing status in one controlled call.
     This avoids client-side parallel tool calls and respects server pacing.
@@ -941,6 +985,8 @@ async def get_top_pages_with_indexing(site_url: str, days: int = 28, limit: int 
         days: Lookback window (default 28)
         limit: Number of top pages to include (default 10)
         batch_size: Number of URLs to process between short pauses (default 3)
+        per_request_sleep_ms: Override sleep between URL inspections (default from env)
+        retries/backoff_seconds/jitter_ms/max_backoff_seconds: per-request retry tuning
     """
     try:
         await INSPECTION_SEMAPHORE.acquire()
@@ -978,10 +1024,17 @@ async def get_top_pages_with_indexing(site_url: str, days: int = 28, limit: int 
             # Inspect
             results = []
             processed_in_batch = 0
+            sleep_ms = GSC_SLEEP_BETWEEN_REQUESTS_MS if per_request_sleep_ms is None else int(per_request_sleep_ms)
             for p in pages:
                 request = {"inspectionUrl": p["url"], "siteUrl": site_url}
                 try:
-                    resp = await _execute_with_retries(lambda: service.urlInspection().index().inspect(body=request).execute())
+                    resp = await _execute_with_retries_cfg(
+                        lambda: service.urlInspection().index().inspect(body=request).execute(),
+                        retries=retries,
+                        base_backoff_seconds=backoff_seconds,
+                        jitter_ms=jitter_ms,
+                        max_backoff_seconds=max_backoff_seconds,
+                    )
                     insp = resp.get("inspectionResult", {})
                     idx = insp.get("indexStatusResult", {})
                     verdict = idx.get("verdict", "UNKNOWN")
@@ -1018,8 +1071,8 @@ async def get_top_pages_with_indexing(site_url: str, days: int = 28, limit: int 
                 processed_in_batch += 1
                 if processed_in_batch >= max(1, int(batch_size)):
                     processed_in_batch = 0
-                    if GSC_SLEEP_BETWEEN_REQUESTS_MS > 0:
-                        await asyncio.sleep(GSC_SLEEP_BETWEEN_REQUESTS_MS / 1000.0)
+                    if sleep_ms > 0:
+                        await asyncio.sleep(sleep_ms / 1000.0)
             # Format table-like output
             out = [f"Top {len(results)} pages for {site_url} (last {days} days) with indexing status:"]
             header = [
