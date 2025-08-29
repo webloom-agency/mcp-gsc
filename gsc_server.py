@@ -482,7 +482,7 @@ async def get_search_analytics(site_url: str, days: int = 28, dimensions: str = 
             data = []
             # Add dimension values
             for dim_value in row.get("keys", []):
-                data.append(dim_value[:100])  # Truncate long values for readability
+                data.append(dim_value)
             
             # Add metrics
             data.append(str(row.get("clicks", 0)))
@@ -1252,7 +1252,7 @@ async def get_advanced_search_analytics(
             data = []
             # Add dimension values
             for dim_value in row.get("keys", []):
-                data.append(dim_value[:100])  # Increased truncation limit to 100 characters
+                data.append(dim_value)
             
             # Add metrics
             data.append(str(row.get("clicks", 0)))
@@ -1441,7 +1441,7 @@ async def get_search_by_page_query(
             ctr = row.get("ctr", 0) * 100
             position = row.get("position", 0)
             
-            result_lines.append(f"{query[:100]} | {clicks} | {impressions} | {ctr:.2f}% | {position:.1f}")
+            result_lines.append(f"{query} | {clicks} | {impressions} | {ctr:.2f}% | {position:.1f}")
         
         # Add total metrics
         total_clicks = sum(row.get("clicks", 0) for row in response.get("rows", []))
