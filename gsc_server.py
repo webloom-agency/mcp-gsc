@@ -1307,6 +1307,14 @@ async def get_advanced_search_analytics(
                    f"- Search type: {search_type}\n"
                    f"- Filter: {filter_dimension} {filter_operator} '{filter_expression}'" if filter_dimension else "- No filter applied")
         
+        # Client-side sort as a safeguard (API may ignore orderBy in some cases)
+        try:
+            metric_key_map = {"clicks": "clicks", "impressions": "impressions", "ctr": "ctr", "position": "position"}
+            metric_key = metric_key_map.get(str(sort_by).lower(), "clicks")
+            rows.sort(key=lambda r: float(r.get(metric_key, 0) or 0.0), reverse=(str(sort_direction).lower() == "descending"))
+        except Exception:
+            pass
+        
         # Format results
         result_lines = [f"Search analytics for {site_url}:"]
         result_lines.append(f"Date range: {start_date} to {end_date}")
@@ -1501,10 +1509,17 @@ async def get_search_by_page_query(
         
         # Execute request
         response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
+        rows = response.get("rows", [])
         
-        if not response.get("rows"):
+        if not rows:
             return f"No search data found for page {page_url} in the last {days} days."
         
+        # Ensure stable ordering client-side (clicks desc)
+        try:
+            rows.sort(key=lambda r: float(r.get("clicks", 0) or 0.0), reverse=True)
+        except Exception:
+            pass
+
         # Format results
         result_lines = [f"Search queries for page {page_url} (last {days} days):"]
         result_lines.append("\n" + "-" * 80 + "\n")
@@ -1514,7 +1529,7 @@ async def get_search_by_page_query(
         result_lines.append("-" * 80)
         
         # Add data rows
-        for row in response.get("rows", []):
+        for row in rows:
             query = row.get("keys", ["Unknown"])[0]
             clicks = row.get("clicks", 0)
             impressions = row.get("impressions", 0)
@@ -1524,8 +1539,8 @@ async def get_search_by_page_query(
             result_lines.append(f"{query} | {clicks} | {impressions} | {ctr:.2f}% | {position:.1f}")
         
         # Add total metrics
-        total_clicks = sum(row.get("clicks", 0) for row in response.get("rows", []))
-        total_impressions = sum(row.get("impressions", 0) for row in response.get("rows", []))
+        total_clicks = sum(row.get("clicks", 0) for row in rows)
+        total_impressions = sum(row.get("impressions", 0) for row in rows)
         avg_ctr = (total_clicks / total_impressions * 100) if total_impressions > 0 else 0
         
         result_lines.append("-" * 80)
