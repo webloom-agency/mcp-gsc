@@ -514,9 +514,12 @@ async def get_search_analytics(site_url: str, days: int = 28, dimensions: str = 
         }
         
         # Execute request (optionally auto-paginate)
-        effective_auto = GSC_AUTO_PAGINATE_DEFAULT if auto_paginate is None else bool(auto_paginate)
+        desired_total = min(int(row_limit), 25000)
+        effective_auto = (GSC_AUTO_PAGINATE_DEFAULT if auto_paginate is None else bool(auto_paginate)) or (auto_paginate is None and desired_total > 1000)
         if effective_auto:
-            rows = await _sa_query_all(service, site_url, request, GSC_AUTO_PAGINATE_MAX_ROWS)
+            # Ensure per-page size is reasonable; API may cap per-call rows
+            request["rowLimit"] = min(desired_total, GSC_SA_PAGE_SIZE)
+            rows = await _sa_query_all(service, site_url, request, max_rows=desired_total)
         else:
             response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
             rows = response.get("rows", [])
@@ -1292,9 +1295,12 @@ async def get_advanced_search_analytics(
             request["dimensionFilterGroups"] = [filter_group]
         
         # Execute request (optionally auto-paginate)
-        effective_auto = GSC_AUTO_PAGINATE_DEFAULT if auto_paginate is None else bool(auto_paginate)
+        desired_total = min(int(row_limit), 25000)  # user-requested cap
+        effective_auto = (GSC_AUTO_PAGINATE_DEFAULT if auto_paginate is None else bool(auto_paginate)) or (auto_paginate is None and desired_total > 1000)
         if effective_auto:
-            rows = await _sa_query_all(service, site_url, request, GSC_AUTO_PAGINATE_MAX_ROWS)
+            # Respect desired_total when auto-paginating
+            request["rowLimit"] = min(desired_total, GSC_SA_PAGE_SIZE)
+            rows = await _sa_query_all(service, site_url, request, max_rows=desired_total)
         else:
             response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
             rows = response.get("rows", [])
