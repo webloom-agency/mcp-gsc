@@ -1268,16 +1268,16 @@ async def get_advanced_search_analytics(
         # Add sorting
         if sort_by:
             metric_map = {
-                "clicks": "CLICK_COUNT",
-                "impressions": "IMPRESSION_COUNT",
-                "ctr": "CTR",
-                "position": "POSITION"
+                "clicks": "clicks",
+                "impressions": "impressions",
+                "ctr": "ctr",
+                "position": "position"
             }
-            
+
             if sort_by in metric_map:
                 request["orderBy"] = [{
-                    "metric": metric_map[sort_by],
-                    "direction": sort_direction.lower()
+                    "field": metric_map[sort_by],
+                    "descending": (str(sort_direction).lower() == "descending")
                 }]
         
         # Add filtering if provided
@@ -1496,7 +1496,7 @@ async def get_search_by_page_query(
                 }]
             }],
             "rowLimit": 20,  # Top 20 queries for this page
-            "orderBy": [{"metric": "CLICK_COUNT", "direction": "descending"}]
+            "orderBy": [{"field": "clicks", "descending": True}]
         }
         
         # Execute request
