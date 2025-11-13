@@ -1225,6 +1225,7 @@ async def get_advanced_search_analytics(
     filter_dimension: str = None,
     filter_operator: str = "contains", 
     filter_expression: str = None,
+    additional_filters: str = None,
     auto_paginate: Optional[bool] = None,
 ) -> str:
     """
@@ -1243,6 +1244,7 @@ async def get_advanced_search_analytics(
         filter_dimension: Dimension to filter on (query, page, country, device)
         filter_operator: Filter operator (contains, equals, notContains, notEquals)
         filter_expression: Filter expression value
+        additional_filters: JSON string with additional filters, e.g. '[{"dimension":"query","operator":"contains","expression":"keyword"}]'
         auto_paginate: If true, fetches all pages up to the global max. Defaults to env GSC_AUTO_PAGINATE_DEFAULT.
     """
     try:
@@ -1283,16 +1285,36 @@ async def get_advanced_search_analytics(
                     "descending": (str(sort_direction).lower() == "descending")
                 }]
         
-        # Add filtering if provided
+        # Add filtering if provided (supports multiple filters with AND logic)
+        filters = []
+        
+        # Add primary filter if provided
         if filter_dimension and filter_expression:
-            filter_group = {
-                "filters": [{
-                    "dimension": filter_dimension,
-                    "operator": filter_operator,
-                    "expression": filter_expression
-                }]
-            }
-            request["dimensionFilterGroups"] = [filter_group]
+            filters.append({
+                "dimension": filter_dimension,
+                "operator": filter_operator,
+                "expression": filter_expression
+            })
+        
+        # Add additional filters if provided
+        if additional_filters:
+            try:
+                additional_filters_list = json.loads(additional_filters)
+                if isinstance(additional_filters_list, list):
+                    for f in additional_filters_list:
+                        if isinstance(f, dict) and "dimension" in f and "expression" in f:
+                            filters.append({
+                                "dimension": f["dimension"],
+                                "operator": f.get("operator", "contains"),
+                                "expression": f["expression"]
+                            })
+            except json.JSONDecodeError:
+                # If JSON parsing fails, ignore additional filters
+                pass
+        
+        # Apply filters if any were provided
+        if filters:
+            request["dimensionFilterGroups"] = [{"filters": filters}]
         
         # Execute request (optionally auto-paginate)
         desired_total = min(int(row_limit), 25000)  # user-requested cap
@@ -1306,12 +1328,19 @@ async def get_advanced_search_analytics(
             rows = response.get("rows", [])
         
         if not rows:
+            filter_info = ""
+            if filters:
+                filter_descriptions = [f"{f['dimension']} {f['operator']} '{f['expression']}'" for f in filters]
+                filter_info = f"- Filters: {' AND '.join(filter_descriptions)}"
+            else:
+                filter_info = "- No filters applied"
+            
             return (f"No search analytics data found for {site_url} with the specified parameters.\n\n"
                    f"Parameters used:\n"
                    f"- Date range: {start_date} to {end_date}\n"
                    f"- Dimensions: {dimensions}\n"
                    f"- Search type: {search_type}\n"
-                   f"- Filter: {filter_dimension} {filter_operator} '{filter_expression}'" if filter_dimension else "- No filter applied")
+                   f"{filter_info}")
         
         # Client-side sort as a safeguard (API may ignore orderBy in some cases)
         try:
@@ -1325,8 +1354,9 @@ async def get_advanced_search_analytics(
         result_lines = [f"Search analytics for {site_url}:"]
         result_lines.append(f"Date range: {start_date} to {end_date}")
         result_lines.append(f"Search type: {search_type}")
-        if filter_dimension:
-            result_lines.append(f"Filter: {filter_dimension} {filter_operator} '{filter_expression}'")
+        if filters:
+            filter_descriptions = [f"{f['dimension']} {f['operator']} '{f['expression']}'" for f in filters]
+            result_lines.append(f"Filters: {' AND '.join(filter_descriptions)}")
         if effective_auto:
             result_lines.append(f"Showing all {len(rows)} rows (sorted by {sort_by} {sort_direction})")
         else:
