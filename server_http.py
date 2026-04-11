@@ -1,5 +1,5 @@
 # server_http.py
-import os, json, contextlib, logging
+import os, json, logging
 from starlette.applications import Starlette
 from starlette.routing import Mount, Route
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -191,17 +191,10 @@ else:
     logger.info("OAuth 2.1 disabled - using legacy authentication mode")
 
 
-# ---- Lifespan ----
-@contextlib.asynccontextmanager
-async def lifespan(app):
-    async with mcp.session_manager.run():
-        yield
-
-
 # ---- Build routes and app ----
 def _create_app():
     """Build the Starlette app with appropriate routes and middleware."""
-    mcp_app = mcp.streamable_http_app()
+    mcp_app = mcp.http_app()
 
     # Add MCPSessionMiddleware when OAuth21 is enabled
     if MCP_ENABLE_OAUTH21 and _auth_provider:
@@ -233,7 +226,6 @@ def _create_app():
     return Starlette(
         routes=routes,
         middleware=middleware,
-        lifespan=lifespan,
     )
 
 
