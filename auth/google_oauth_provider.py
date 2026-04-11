@@ -71,7 +71,11 @@ class GoogleOAuthProvider(OAuthProvider):
         super().__init__(
             base_url=base_url,
             required_scopes=GSC_SCOPES,
-            client_registration_options=ClientRegistrationOptions(enabled=True),
+            client_registration_options=ClientRegistrationOptions(
+                enabled=True,
+                valid_scopes=GSC_SCOPES,
+                default_scopes=GSC_SCOPES,
+            ),
         )
 
         # In-memory stores (survive for the lifetime of the process)
