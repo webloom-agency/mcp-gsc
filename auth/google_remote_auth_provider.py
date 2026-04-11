@@ -107,117 +107,112 @@ class GoogleRemoteAuthProvider(RemoteAuthProvider):
         logger.info(f"Registered {len(routes)} OAuth routes")
         return routes
 
+    async def _verify_via_tokeninfo(self, token: str) -> Optional[AccessToken]:
+        """Verify a token using Google's tokeninfo endpoint (works for any Google token format)."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"https://oauth2.googleapis.com/tokeninfo?access_token={token}"
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        logger.info(f"tokeninfo verification failed: HTTP {response.status}")
+                        return None
+
+                    token_info = await response.json()
+                    logger.info(f"tokeninfo response: aud={token_info.get('aud')}, email={token_info.get('email')}, expires_in={token_info.get('expires_in')}")
+
+                    if token_info.get("aud") != self.client_id:
+                        logger.info(
+                            f"Token audience mismatch: expected {self.client_id}, got {token_info.get('aud')}"
+                        )
+                        return None
+
+                    expires_in = int(token_info.get("expires_in", 0))
+                    if expires_in <= 0:
+                        logger.info("Token is expired")
+                        return None
+
+                    expires_at = int(time.time()) + expires_in
+                    claims = {
+                        "email": token_info.get("email"),
+                        "sub": token_info.get("sub"),
+                        "aud": token_info.get("aud"),
+                        "scope": token_info.get("scope", ""),
+                    }
+                    scopes = token_info.get("scope", "").split()
+
+                    access_token_obj = AccessToken(
+                        token=token,
+                        client_id=self.client_id,
+                        scopes=scopes,
+                        expires_at=expires_at,
+                        claims=claims,
+                    )
+
+                    user_email = token_info.get("email")
+                    if user_email:
+                        from auth.oauth21_session_store import get_oauth21_session_store
+
+                        store = get_oauth21_session_store()
+                        session_id = f"google_{token_info.get('sub', 'unknown')}"
+
+                        mcp_session_id = None
+                        try:
+                            from fastmcp.server.dependencies import get_context
+                            ctx = get_context()
+                            if ctx and hasattr(ctx, "session_id"):
+                                mcp_session_id = ctx.session_id
+                        except Exception:
+                            pass
+
+                        store.store_session(
+                            user_email=user_email,
+                            access_token=token,
+                            scopes=scopes,
+                            session_id=session_id,
+                            mcp_session_id=mcp_session_id,
+                            issuer="https://accounts.google.com",
+                        )
+
+                        logger.info(f"Verified token for user: {user_email}")
+
+                    return access_token_obj
+
+        except Exception as e:
+            logger.error(f"Error in tokeninfo verification: {e}", exc_info=True)
+            return None
+
     async def verify_token(self, token: str) -> Optional[AccessToken]:
         """
         Override verify_token to handle Google OAuth access tokens.
 
-        Google OAuth access tokens (ya29.*) are opaque tokens that need to be
-        verified using the tokeninfo endpoint, not JWT verification.
+        Tries JWT verification first (for id_tokens), then falls back to
+        Google's tokeninfo endpoint for opaque access tokens of any format.
         """
         token_prefix = token[:10] if len(token) > 10 else token
-        logger.info(f"verify_token called, token starts with: {token_prefix}...")
+        logger.info(f"verify_token called, token prefix: {token_prefix}...")
 
-        if token.startswith("ya29."):
-            logger.info("Detected Google OAuth access token, using tokeninfo verification")
-
-            try:
-                async with aiohttp.ClientSession() as session:
-                    url = f"https://oauth2.googleapis.com/tokeninfo?access_token={token}"
-                    async with session.get(url) as response:
-                        if response.status != 200:
-                            logger.info(f"Token verification failed: {response.status}")
-                            return None
-
-                        token_info = await response.json()
-                        logger.info(f"tokeninfo response: aud={token_info.get('aud')}, email={token_info.get('email')}, expires_in={token_info.get('expires_in')}")
-
-                        if token_info.get("aud") != self.client_id:
-                            logger.info(
-                                f"Token audience mismatch: expected {self.client_id}, got {token_info.get('aud')}"
-                            )
-                            return None
-
-                        expires_in = int(token_info.get("expires_in", 0))
-                        if expires_in <= 0:
-                            logger.info("Token is expired")
-                            return None
-
-                        expires_at = int(time.time()) + expires_in
-
-                        claims = {
-                            "email": token_info.get("email"),
-                            "sub": token_info.get("sub"),
-                            "aud": token_info.get("aud"),
-                            "scope": token_info.get("scope", ""),
-                        }
-                        scopes = token_info.get("scope", "").split()
-
-                        access_token_obj = AccessToken(
-                            token=token,
-                            client_id=self.client_id,
-                            scopes=scopes,
-                            expires_at=expires_at,
-                            claims=claims,
-                        )
-
-                        user_email = token_info.get("email")
-                        if user_email:
-                            from auth.oauth21_session_store import get_oauth21_session_store
-
-                            store = get_oauth21_session_store()
-                            session_id = f"google_{token_info.get('sub', 'unknown')}"
-
-                            mcp_session_id = None
-                            try:
-                                from fastmcp.server.dependencies import get_context
-                                ctx = get_context()
-                                if ctx and hasattr(ctx, "session_id"):
-                                    mcp_session_id = ctx.session_id
-                            except Exception:
-                                pass
-
-                            store.store_session(
-                                user_email=user_email,
-                                access_token=token,
-                                scopes=scopes,
-                                session_id=session_id,
-                                mcp_session_id=mcp_session_id,
-                                issuer="https://accounts.google.com",
-                            )
-
-                            logger.info(f"Verified OAuth token for user: {user_email}")
-
-                        return access_token_obj
-
-            except Exception as e:
-                logger.error(f"Error verifying Google OAuth token: {e}", exc_info=True)
-                return None
-
-        else:
-            logger.info(f"Using JWT verification for non-OAuth token (prefix: {token_prefix})")
+        # Try JWT verification first (fast, local check)
+        try:
             access_token = await super().verify_token(token)
-
             if access_token:
                 logger.info(f"JWT verification succeeded: client_id={access_token.client_id}")
-            else:
-                logger.info("JWT verification failed - token rejected")
+                if self.client_id:
+                    user_email = access_token.claims.get("email")
+                    if user_email:
+                        from auth.oauth21_session_store import get_oauth21_session_store
+                        store = get_oauth21_session_store()
+                        store.store_session(
+                            user_email=user_email,
+                            access_token=token,
+                            scopes=access_token.scopes or [],
+                            session_id=f"google_{access_token.claims.get('sub', 'unknown')}",
+                            issuer="https://accounts.google.com",
+                        )
+                        logger.info(f"Verified JWT token for user: {user_email}")
+                return access_token
+        except Exception:
+            pass
 
-            if access_token and self.client_id:
-                user_email = access_token.claims.get("email")
-                if user_email:
-                    from auth.oauth21_session_store import get_oauth21_session_store
-
-                    store = get_oauth21_session_store()
-                    session_id = f"google_{access_token.claims.get('sub', 'unknown')}"
-
-                    store.store_session(
-                        user_email=user_email,
-                        access_token=token,
-                        scopes=access_token.scopes or [],
-                        session_id=session_id,
-                        issuer="https://accounts.google.com",
-                    )
-
-                    logger.info(f"Verified JWT token for user: {user_email}")
-
-            return access_token
+        # JWT failed -- try Google tokeninfo endpoint (handles ya29.*, opaque tokens, etc.)
+        logger.info("JWT verification failed, trying Google tokeninfo endpoint")
+        return await self._verify_via_tokeninfo(token)

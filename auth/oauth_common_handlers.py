@@ -103,7 +103,9 @@ async def handle_proxy_token_exchange(request: Request):
                 if response.status != 200:
                     logger.error(f"Token exchange failed: {response.status} - {response_data}")
                 else:
-                    logger.info("Token exchange successful")
+                    at = response_data.get("access_token", "")
+                    at_prefix = at[:12] if at else "(none)"
+                    logger.info(f"Token exchange successful - access_token prefix: {at_prefix}, token_type: {response_data.get('token_type')}, has_id_token: {'id_token' in response_data}")
 
                     if "access_token" in response_data:
                         try:
