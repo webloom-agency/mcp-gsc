@@ -17,11 +17,8 @@ import google_auth_httplib2
 import asyncio
 import random
 
-# MCP - prefer fastmcp for auth/middleware support, fall back to mcp
-try:
-    from fastmcp import FastMCP
-except ImportError:
-    from mcp.server.fastmcp import FastMCP
+# MCP
+from fastmcp import FastMCP
 
 logger = logging.getLogger(__name__)
 
