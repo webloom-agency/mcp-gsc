@@ -34,7 +34,7 @@ from mcp.server.auth.provider import (
 )
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
-from fastmcp.server.auth.auth import OAuthProvider, AccessToken
+from fastmcp.server.auth.auth import OAuthProvider, AccessToken, ClientRegistrationOptions
 
 from auth.scopes import SCOPES as GSC_SCOPES
 from auth.credential_store import get_credential_store
@@ -68,7 +68,11 @@ class GoogleOAuthProvider(OAuthProvider):
 
         self.google_callback_uri = f"{base_url.rstrip('/')}/oauth2callback"
 
-        super().__init__(base_url=base_url, required_scopes=GSC_SCOPES)
+        super().__init__(
+            base_url=base_url,
+            required_scopes=GSC_SCOPES,
+            client_registration_options=ClientRegistrationOptions(enabled=True),
+        )
 
         # In-memory stores (survive for the lifetime of the process)
         self.clients: dict[str, OAuthClientInformationFull] = {}
