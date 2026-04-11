@@ -7,6 +7,8 @@ from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse
 
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+
 import gsc_server
 
 logger = logging.getLogger(__name__)
@@ -196,36 +198,20 @@ def _create_app():
     """Build the Starlette app with appropriate routes and middleware."""
     mcp_app = mcp.http_app()
 
-    # Add MCPSessionMiddleware when OAuth21 is enabled
     if MCP_ENABLE_OAUTH21 and _auth_provider:
-        try:
-            from auth.mcp_session_middleware import MCPSessionMiddleware
-            mcp_app.user_middleware.insert(0, Middleware(MCPSessionMiddleware))
-            mcp_app.middleware_stack = mcp_app.build_middleware_stack()
-            logger.info("MCPSessionMiddleware added to MCP app")
-        except Exception as e:
-            logger.error(f"Failed to add MCPSessionMiddleware: {e}")
+        return mcp_app
 
-    if MCP_ENABLE_OAUTH21 and _auth_provider:
-        # OAuth 2.1 mode: GoogleRemoteAuthProvider handles OAuth routes via mcp.auth
-        routes = [
-            Mount("/", app=mcp_app),
-        ]
-        middleware = []
-    else:
-        # Legacy mode: use old OAuth routes and bearer auth
-        routes = [
-            Route("/oauth2/authorize", oauth_authorize),
-            Route("/oauth2/start", oauth_start),
-            Route("/oauth2/callback", oauth_callback),
-            Route("/oauth2/exchange", oauth_exchange),
-            Mount("/", app=mcp_app),
-        ]
-        middleware = [Middleware(BearerAuthMiddleware)]
-
+    routes = [
+        Route("/oauth2/authorize", oauth_authorize),
+        Route("/oauth2/start", oauth_start),
+        Route("/oauth2/callback", oauth_callback),
+        Route("/oauth2/exchange", oauth_exchange),
+        Mount("/", app=mcp_app),
+    ]
     return Starlette(
         routes=routes,
-        middleware=middleware,
+        middleware=[Middleware(BearerAuthMiddleware)],
+        lifespan=mcp_app.lifespan,
     )
 
 
