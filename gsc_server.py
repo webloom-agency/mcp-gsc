@@ -1,6 +1,7 @@
 from typing import Any, Dict, List, Optional
 import os
 import json
+import logging
 from datetime import datetime, timedelta
 
 import google.auth
@@ -16,10 +17,23 @@ import google_auth_httplib2
 import asyncio
 import random
 
-# MCP
-from mcp.server.fastmcp import FastMCP
+# MCP - prefer fastmcp for auth/middleware support, fall back to mcp
+try:
+    from fastmcp import FastMCP
+except ImportError:
+    from mcp.server.fastmcp import FastMCP
+
+logger = logging.getLogger(__name__)
 
 mcp = FastMCP("gsc-server")
+
+# Add auth middleware for per-user OAuth (requires fastmcp with middleware support)
+try:
+    from auth.auth_info_middleware import AuthInfoMiddleware
+    mcp.add_middleware(AuthInfoMiddleware())
+    logger.info("AuthInfoMiddleware added to MCP server")
+except (ImportError, AttributeError) as e:
+    logger.debug(f"Auth middleware not available (stdio-only mode): {e}")
 
 # Path to your service account JSON or user credentials JSON
 # First check if GSC_CREDENTIALS_PATH environment variable is set
@@ -264,11 +278,60 @@ def _resolve_site_url(service, provided: str) -> str:
     # Fallback to provided (let API error if invalid)
     return provided
 
-def get_gsc_service():
+def _get_authenticated_user_email() -> Optional[str]:
+    """Extract the authenticated user email from FastMCP context (per-user OAuth)."""
+    try:
+        from fastmcp.server.dependencies import get_context
+        ctx = get_context()
+        if ctx:
+            return ctx.get_state("authenticated_user_email")
+    except Exception:
+        pass
+    return None
+
+
+def get_credentials_for_user(user_email: str) -> Credentials:
+    """
+    Get Google credentials for a specific user from the per-user auth system.
+    Checks the in-memory OAuth21 session store first, then falls back to
+    on-disk per-user credential files.
+    """
+    from auth.oauth21_session_store import get_oauth21_session_store
+    from auth.credential_store import get_credential_store
+
+    store = get_oauth21_session_store()
+    creds = store.get_credentials(user_email)
+    if creds:
+        if creds.valid:
+            return creds
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            return creds
+
+    cred_store = get_credential_store()
+    creds = cred_store.get_credential(user_email)
+    if creds:
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            cred_store.store_credential(user_email, creds)
+        return creds
+
+    raise ValueError(f"No credentials found for user {user_email}. Please authenticate via OAuth first.")
+
+
+def get_gsc_service(user_email: str = None):
     """
     Returns an authorized Search Console service object.
-    First tries OAuth authentication, then falls back to service account.
+    If user_email is provided (per-user OAuth), uses that user's credentials.
+    Otherwise falls back to legacy single-credential mode.
     """
+    # Per-user OAuth path
+    if user_email:
+        try:
+            creds = get_credentials_for_user(user_email)
+            return _build_gsc_service(creds)
+        except Exception as e:
+            logger.debug(f"Per-user auth failed for {user_email}, falling back to legacy: {e}")
     # Try OAuth authentication first if not skipped
     if not SKIP_OAUTH:
         # Prefer credentials loaded from a persisted token file (for non-interactive environments)
@@ -339,7 +402,7 @@ async def list_properties() -> str:
     Retrieves and returns the user's Search Console properties.
     """
     try:
-        service = get_gsc_service()
+        service = get_gsc_service(_get_authenticated_user_email())
         site_list = service.sites().list().execute()
 
         # site_list is typically something like:
@@ -383,7 +446,7 @@ async def add_site(site_url: str) -> str:
         site_url: The URL of the site to add (must be exact match e.g. https://example.com, or https://www.example.com, or https://subdomain.example.com/path/, for domain properties use format: sc-domain:example.com)
     """
     try:
-        service = get_gsc_service()
+        service = get_gsc_service(_get_authenticated_user_email())
         
         # Add the site
         response = service.sites().add(siteUrl=site_url).execute()
@@ -439,7 +502,7 @@ async def delete_site(site_url: str) -> str:
         site_url: The URL of the site to remove (must be exact match e.g. https://example.com, or https://www.example.com, or https://subdomain.example.com/path/, for domain properties use format: sc-domain:example.com)
     """
     try:
-        service = get_gsc_service()
+        service = get_gsc_service(_get_authenticated_user_email())
         
         # Delete the site
         service.sites().delete(siteUrl=site_url).execute()
@@ -494,7 +557,7 @@ async def get_search_analytics(site_url: str, days: int = 28, dimensions: str = 
         auto_paginate: If true, fetches all pages up to the global max. Defaults to env GSC_AUTO_PAGINATE_DEFAULT.
     """
     try:
-        service = get_gsc_service()
+        service = get_gsc_service(_get_authenticated_user_email())
         site_url = _resolve_site_url(service, site_url)
         
         # Calculate date range
@@ -575,7 +638,7 @@ async def get_site_details(site_url: str) -> str:
         site_url: The URL of the site in Search Console (must be exact match)
     """
     try:
-        service = get_gsc_service()
+        service = get_gsc_service(_get_authenticated_user_email())
         site_url = _resolve_site_url(service, site_url)
         
         # Get site details
@@ -621,7 +684,7 @@ async def get_sitemaps(site_url: str) -> str:
         site_url: The URL of the site in Search Console (must be exact match)
     """
     try:
-        service = get_gsc_service()
+        service = get_gsc_service(_get_authenticated_user_email())
         site_url = _resolve_site_url(service, site_url)
         
         # Get sitemaps list
@@ -686,7 +749,7 @@ async def inspect_url_enhanced(site_url: str, page_url: str) -> str:
     try:
         await INSPECTION_SEMAPHORE.acquire()
         try:
-            service = get_gsc_service()
+            service = get_gsc_service(_get_authenticated_user_email())
             site_url = _resolve_site_url(service, site_url)
             
             # Build request
@@ -809,7 +872,7 @@ async def batch_url_inspection(site_url: str, urls: str) -> str:
     try:
         await INSPECTION_SEMAPHORE.acquire()
         try:
-            service = get_gsc_service()
+            service = get_gsc_service(_get_authenticated_user_email())
             site_url = _resolve_site_url(service, site_url)
             
             # Parse URLs
@@ -895,7 +958,7 @@ async def check_indexing_issues(site_url: str, urls: str) -> str:
     try:
         await INSPECTION_SEMAPHORE.acquire()
         try:
-            service = get_gsc_service()
+            service = get_gsc_service(_get_authenticated_user_email())
             site_url = _resolve_site_url(service, site_url)
             
             # Parse URLs
@@ -1021,7 +1084,7 @@ async def get_top_pages_with_indexing(
     try:
         await INSPECTION_SEMAPHORE.acquire()
         try:
-            service = get_gsc_service()
+            service = get_gsc_service(_get_authenticated_user_email())
             site_url = _resolve_site_url(service, site_url)
             end_date = datetime.now().date()
             start_date = end_date - timedelta(days=days)
@@ -1140,7 +1203,7 @@ async def get_performance_overview(site_url: str, days: int = 28) -> str:
         days: Number of days to look back (default: 28)
     """
     try:
-        service = get_gsc_service()
+        service = get_gsc_service(_get_authenticated_user_email())
         site_url = _resolve_site_url(service, site_url)
         
         # Calculate date range
@@ -1248,7 +1311,7 @@ async def get_advanced_search_analytics(
         auto_paginate: If true, fetches all pages up to the global max. Defaults to env GSC_AUTO_PAGINATE_DEFAULT.
     """
     try:
-        service = get_gsc_service()
+        service = get_gsc_service(_get_authenticated_user_email())
         site_url = _resolve_site_url(service, site_url)
         
         # Calculate date range if not provided
@@ -1421,7 +1484,7 @@ async def compare_search_periods(
         auto_paginate: If true, fetches all pages up to the global max. Defaults to env GSC_AUTO_PAGINATE_DEFAULT.
     """
     try:
-        service = get_gsc_service()
+        service = get_gsc_service(_get_authenticated_user_email())
         site_url = _resolve_site_url(service, site_url)
         
         # Parse dimensions
@@ -1520,7 +1583,7 @@ async def get_search_by_page_query(
         days: Number of days to look back (default: 28)
     """
     try:
-        service = get_gsc_service()
+        service = get_gsc_service(_get_authenticated_user_email())
         site_url = _resolve_site_url(service, site_url)
         
         # Calculate date range
@@ -1596,7 +1659,7 @@ async def list_sitemaps_enhanced(site_url: str, sitemap_index: str = None) -> st
         sitemap_index: Optional sitemap index URL to list child sitemaps
     """
     try:
-        service = get_gsc_service()
+        service = get_gsc_service(_get_authenticated_user_email())
         site_url = _resolve_site_url(service, site_url)
         
         # Get sitemaps list
@@ -1675,7 +1738,7 @@ async def get_sitemap_details(site_url: str, sitemap_url: str) -> str:
         sitemap_url: The full URL of the sitemap to inspect
     """
     try:
-        service = get_gsc_service()
+        service = get_gsc_service(_get_authenticated_user_email())
         site_url = _resolve_site_url(service, site_url)
         
         # Get sitemap details
@@ -1744,7 +1807,7 @@ async def submit_sitemap(site_url: str, sitemap_url: str) -> str:
         sitemap_url: The full URL of the sitemap to submit
     """
     try:
-        service = get_gsc_service()
+        service = get_gsc_service(_get_authenticated_user_email())
         site_url = _resolve_site_url(service, site_url)
         
         # Submit the sitemap
@@ -1790,7 +1853,7 @@ async def delete_sitemap(site_url: str, sitemap_url: str) -> str:
         sitemap_url: The full URL of the sitemap to delete
     """
     try:
-        service = get_gsc_service()
+        service = get_gsc_service(_get_authenticated_user_email())
         site_url = _resolve_site_url(service, site_url)
         
         # First check if the sitemap exists
@@ -1901,7 +1964,7 @@ async def find_queries_dropped_week_over_week(
         limit: Max number of rows in the output
     """
     try:
-        service = get_gsc_service()
+        service = get_gsc_service(_get_authenticated_user_email())
         site_url = _resolve_site_url(service, site_url)
         country = (country or "FRA").upper()
 
