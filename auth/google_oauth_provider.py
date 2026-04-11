@@ -269,7 +269,13 @@ class GoogleOAuthProvider(OAuthProvider):
             return None
 
     async def _extract_user_email(self, token_data: dict) -> Optional[str]:
-        """Get user email from id_token or userinfo endpoint."""
+        """
+        Get user email from id_token or userinfo endpoint.
+
+        Signature verification is skipped because the id_token was received
+        directly from Google's token endpoint over TLS in _exchange_google_code(),
+        not from the client. A user cannot inject a forged id_token into this flow.
+        """
         # Try id_token first (fast, no extra request)
         id_token = token_data.get("id_token")
         if id_token:
@@ -279,10 +285,12 @@ class GoogleOAuthProvider(OAuthProvider):
                 email = claims.get("email")
                 if email and claims.get("email_verified", False):
                     return email
+                if email and not claims.get("email_verified", False):
+                    logger.warning("Rejecting unverified email from id_token: %s", email)
             except Exception as e:
                 logger.debug("id_token decode failed: %s", e)
 
-        # Fallback: call Google userinfo endpoint
+        # Fallback: call Google userinfo endpoint (also server-to-server over TLS)
         access_token = token_data.get("access_token")
         if access_token:
             try:
@@ -293,7 +301,11 @@ class GoogleOAuthProvider(OAuthProvider):
                     ) as resp:
                         if resp.status == 200:
                             info = await resp.json()
-                            return info.get("email")
+                            email = info.get("email")
+                            if email and info.get("email_verified", False):
+                                return email
+                            if email:
+                                logger.warning("Rejecting unverified email from userinfo: %s", email)
             except Exception as e:
                 logger.debug("userinfo fetch failed: %s", e)
 
