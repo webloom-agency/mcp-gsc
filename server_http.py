@@ -171,22 +171,18 @@ _auth_provider = None
 
 if MCP_ENABLE_OAUTH21:
     try:
-        from auth.oauth_config import set_transport_mode, get_oauth_config
-        from auth.oauth21_session_store import set_auth_provider
-        from auth.google_remote_auth_provider import GoogleRemoteAuthProvider, REMOTEAUTHPROVIDER_AVAILABLE
+        from auth.oauth_config import get_oauth_config
+        from auth.google_oauth_provider import GoogleOAuthProvider
 
-        set_transport_mode("streamable-http")
         config = get_oauth_config()
+        base_url = config.get_oauth_base_url()
 
         if not config.is_configured():
             logger.warning("OAuth 2.1 enabled but GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET not configured")
-        elif not REMOTEAUTHPROVIDER_AVAILABLE:
-            logger.error("OAuth 2.1 enabled but FastMCP 2.11.1+ is not installed (missing RemoteAuthProvider)")
         else:
-            _auth_provider = GoogleRemoteAuthProvider()
+            _auth_provider = GoogleOAuthProvider(base_url=base_url)
             mcp.auth = _auth_provider
-            set_auth_provider(_auth_provider)
-            logger.info("OAuth 2.1 per-user authentication enabled")
+            logger.info("OAuth 2.1 per-user authentication enabled (OAuthProvider)")
     except Exception as e:
         logger.error(f"Failed to initialize OAuth 2.1 auth: {e}", exc_info=True)
 else:
