@@ -115,13 +115,15 @@ class GoogleOAuthProvider(OAuthProvider):
     ) -> str:
         google_state = secrets.token_urlsafe(32)
 
+        scopes = params.scopes if params.scopes else list(GSC_SCOPES)
+
         self.pending_authorizations[google_state] = {
             "client_id": client.client_id,
             "redirect_uri": str(params.redirect_uri),
             "redirect_uri_provided_explicitly": params.redirect_uri_provided_explicitly,
             "state": params.state,
             "code_challenge": params.code_challenge,
-            "scopes": params.scopes or [],
+            "scopes": scopes,
         }
 
         google_params: dict[str, str] = {
