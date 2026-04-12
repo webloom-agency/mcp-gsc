@@ -44,6 +44,12 @@ from auth import mcp_oauth_state_store as _oauth_state_store
 
 logger = logging.getLogger(__name__)
 
+
+class _OAuthTokenWithIdToken(OAuthToken):
+    """Extends OAuthToken to carry the Google id_token through to the client."""
+    id_token: str | None = None
+
+
 DEFAULT_AUTH_CODE_EXPIRY = 5 * 60
 DEFAULT_ACCESS_TOKEN_EXPIRY = 60 * 60
 DEFAULT_REFRESH_TOKEN_EXPIRY = 30 * 24 * 60 * 60
@@ -98,6 +104,8 @@ class GoogleOAuthProvider(OAuthProvider):
         # Mappings: MCP token → user email (to retrieve Google creds)
         self.pending_authorizations: dict[str, dict] = {}
         self.auth_code_to_email: dict[str, str] = {}
+        self._auth_code_to_id_token: dict[str, str] = {}
+        self._user_id_tokens: dict[str, str] = {}
         self.token_to_email: dict[str, str] = {}
 
         if self._oauth_persist:
@@ -305,6 +313,10 @@ class GoogleOAuthProvider(OAuthProvider):
             code_challenge=pending["code_challenge"],
         )
         self.auth_code_to_email[mcp_code] = user_email
+        google_id_token = token_data.get("id_token")
+        if google_id_token:
+            self._auth_code_to_id_token[mcp_code] = google_id_token
+            self._user_id_tokens[user_email] = google_id_token
 
         logger.info(
             "Google callback success: user=%s, redirecting to client", user_email
@@ -429,6 +441,7 @@ class GoogleOAuthProvider(OAuthProvider):
     ) -> OAuthToken:
         self.auth_codes.pop(authorization_code.code, None)
         user_email = self.auth_code_to_email.pop(authorization_code.code, None)
+        google_id_token = self._auth_code_to_id_token.pop(authorization_code.code, None)
 
         access_token_value = secrets.token_urlsafe(32)
         refresh_token_value = secrets.token_urlsafe(32)
@@ -455,15 +468,19 @@ class GoogleOAuthProvider(OAuthProvider):
         await self._persist_oauth_state()
 
         logger.info(
-            "Issued MCP tokens for user=%s (client=%s)", user_email, client.client_id
+            "Issued MCP tokens for user=%s (client=%s), has_id_token=%s",
+            user_email,
+            client.client_id,
+            google_id_token is not None,
         )
 
-        return OAuthToken(
+        return _OAuthTokenWithIdToken(
             access_token=access_token_value,
             token_type="Bearer",
             expires_in=DEFAULT_ACCESS_TOKEN_EXPIRY,
             refresh_token=refresh_token_value,
             scope=" ".join(authorization_code.scopes),
+            id_token=google_id_token,
         )
 
     # ------------------------------------------------------------------
@@ -531,12 +548,14 @@ class GoogleOAuthProvider(OAuthProvider):
             client.client_id,
         )
 
-        return OAuthToken(
+        google_id_token = self._user_id_tokens.get(user_email) if user_email else None
+        return _OAuthTokenWithIdToken(
             access_token=new_access,
             token_type="Bearer",
             expires_in=DEFAULT_ACCESS_TOKEN_EXPIRY,
             refresh_token=new_refresh,
             scope=" ".join(scopes),
+            id_token=google_id_token,
         )
 
     def _try_refresh_google_token(self, user_email: str) -> None:
