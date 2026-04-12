@@ -109,19 +109,23 @@ def serialize_state(
     refresh_tokens: dict[str, RefreshToken],
     token_to_email: dict[str, str],
 ) -> dict[str, Any]:
+    clients_snap = dict(clients)
+    access_snap = dict(access_tokens)
+    refresh_snap = dict(refresh_tokens)
+    email_snap = dict(token_to_email)
     return {
         "version": STATE_VERSION,
         "saved_at": time.time(),
         "clients": {
-            k: v.model_dump(mode="json") for k, v in clients.items()
+            k: v.model_dump(mode="json") for k, v in clients_snap.items()
         },
         "access_tokens": {
-            k: v.model_dump(mode="json") for k, v in access_tokens.items()
+            k: v.model_dump(mode="json") for k, v in access_snap.items()
         },
         "refresh_tokens": {
-            k: v.model_dump(mode="json") for k, v in refresh_tokens.items()
+            k: v.model_dump(mode="json") for k, v in refresh_snap.items()
         },
-        "token_to_email": dict(token_to_email),
+        "token_to_email": email_snap,
     }
 
 
