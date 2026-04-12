@@ -177,3 +177,12 @@ def set_credential_store(store: CredentialStore):
     global _credential_store
     _credential_store = store
     logger.info(f"Set credential store: {type(store).__name__}")
+
+
+def get_credential_storage_directory() -> str:
+    """Resolved credentials directory used for per-user Google tokens and MCP OAuth state."""
+    store = get_credential_store()
+    base = getattr(store, "base_dir", None)
+    if isinstance(base, str) and base:
+        return base
+    return LocalDirectoryCredentialStore().base_dir
