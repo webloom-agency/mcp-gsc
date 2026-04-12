@@ -524,7 +524,12 @@ class GoogleOAuthProvider(OAuthProvider):
 
         await self._persist_oauth_state()
 
-        logger.info("Rotated MCP tokens for user=%s", user_email)
+        logger.info(
+            "Rotated MCP tokens for user=%s, access_prefix=%s, client=%s",
+            user_email,
+            new_access[:12],
+            client.client_id,
+        )
 
         return OAuthToken(
             access_token=new_access,
@@ -554,11 +559,20 @@ class GoogleOAuthProvider(OAuthProvider):
     async def load_access_token(self, token: str) -> Optional[AccessToken]:
         at = self.access_tokens.get(token)
         if not at:
+            prefix = token[:12] if len(token) > 12 else token
+            logger.warning(
+                "load_access_token: token NOT FOUND prefix=%s, "
+                "store has %d access tokens, %d clients",
+                prefix,
+                len(self.access_tokens),
+                len(self.clients),
+            )
             return None
         if at.expires_at is not None and at.expires_at < time.time():
             self.access_tokens.pop(token, None)
             self.token_to_email.pop(token, None)
             await self._persist_oauth_state()
+            logger.warning("load_access_token: token expired")
             return None
         return at
 
