@@ -9,14 +9,11 @@ Full OAuth Authorization Server that:
 """
 
 import os
-import json
 import secrets
 import time
 import logging
-import asyncio
-import tempfile
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional
+from typing import Optional
 from urllib.parse import urlencode, parse_qs
 
 import aiohttp
@@ -47,13 +44,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_AUTH_CODE_EXPIRY = 5 * 60
 DEFAULT_ACCESS_TOKEN_EXPIRY = 60 * 60
 DEFAULT_REFRESH_TOKEN_EXPIRY = 30 * 24 * 60 * 60
-
-
-def _int_env(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except ValueError:
-        return default
 
 
 class GoogleOAuthProvider(OAuthProvider):
@@ -88,15 +78,7 @@ class GoogleOAuthProvider(OAuthProvider):
             ),
         )
 
-        self._access_ttl = _int_env(
-            "GSC_MCP_ACCESS_TOKEN_TTL_SECONDS", DEFAULT_ACCESS_TOKEN_EXPIRY
-        )
-        self._refresh_ttl = _int_env(
-            "GSC_MCP_REFRESH_TOKEN_TTL_SECONDS", DEFAULT_REFRESH_TOKEN_EXPIRY
-        )
-
-        # In-memory stores; clients + tokens are also persisted to disk so Render
-        # restarts do not force every user through full OAuth again.
+        # In-memory stores (survive for the lifetime of the process)
         self.clients: dict[str, OAuthClientInformationFull] = {}
         self.auth_codes: dict[str, AuthorizationCode] = {}
         self.access_tokens: dict[str, AccessToken] = {}
@@ -107,154 +89,11 @@ class GoogleOAuthProvider(OAuthProvider):
         self.auth_code_to_email: dict[str, str] = {}
         self.token_to_email: dict[str, str] = {}
 
-        self._oauth_lock = asyncio.Lock()
-        self._oauth_state_path = self._oauth_state_file_path()
-        self._load_persisted_oauth_state()
-
         logger.info(
-            "GoogleOAuthProvider initialized: base_url=%s, google_callback=%s, "
-            "oauth_state_path=%s, access_ttl_s=%s, refresh_ttl_s=%s",
+            "GoogleOAuthProvider initialized: base_url=%s, google_callback=%s",
             base_url,
             self.google_callback_uri,
-            self._oauth_state_path,
-            self._access_ttl,
-            self._refresh_ttl,
         )
-
-    def _oauth_state_file_path(self) -> str:
-        explicit = os.getenv("GSC_MCP_OAUTH_STATE_FILE")
-        if explicit:
-            return explicit
-        base = os.getenv("GOOGLE_MCP_CREDENTIALS_DIR") or os.getenv(
-            "GSC_MCP_CREDENTIALS_DIR"
-        )
-        if base:
-            return os.path.join(base, "mcp_oauth_server_state.json")
-        home = os.path.expanduser("~")
-        if home and home != "~":
-            return os.path.join(
-                home, ".mcp_gsc", "credentials", "mcp_oauth_server_state.json"
-            )
-        return os.path.join(os.getcwd(), ".credentials", "mcp_oauth_server_state.json")
-
-    def _load_persisted_oauth_state(self) -> None:
-        path = self._oauth_state_path
-        if not os.path.exists(path):
-            logger.info("No MCP OAuth state file at %s (fresh start)", path)
-            return
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                raw: Dict[str, Any] = json.load(f)
-        except Exception as e:
-            logger.warning("Could not read MCP OAuth state from %s: %s", path, e)
-            return
-
-        now = time.time()
-        for cid, cdata in raw.get("clients", {}).items():
-            try:
-                self.clients[cid] = OAuthClientInformationFull.model_validate(cdata)
-            except Exception as e:
-                logger.warning("Skipping invalid OAuth client %s: %s", cid, e)
-
-        for tok, tdata in raw.get("access_tokens", {}).items():
-            try:
-                exp = tdata.get("expires_at")
-                if exp is not None and exp < now:
-                    continue
-                self.access_tokens[tok] = AccessToken(
-                    token=tdata["token"],
-                    client_id=tdata["client_id"],
-                    scopes=tdata.get("scopes") or [],
-                    expires_at=tdata.get("expires_at"),
-                    resource=tdata.get("resource"),
-                    claims=tdata.get("claims") or {},
-                )
-            except Exception as e:
-                logger.warning("Skipping invalid access token entry: %s", e)
-
-        for tok, tdata in raw.get("refresh_tokens", {}).items():
-            try:
-                exp = tdata.get("expires_at")
-                if exp is not None and exp < now:
-                    continue
-                self.refresh_tokens[tok] = RefreshToken(
-                    token=tdata["token"],
-                    client_id=tdata["client_id"],
-                    scopes=tdata.get("scopes") or [],
-                    expires_at=tdata.get("expires_at"),
-                )
-            except Exception as e:
-                logger.warning("Skipping invalid refresh token entry: %s", e)
-
-        saved_map = raw.get("token_to_email") or {}
-        valid = set(self.access_tokens) | set(self.refresh_tokens)
-        for tok, email in saved_map.items():
-            if tok in valid and email:
-                self.token_to_email[tok] = email
-
-        logger.info(
-            "Restored MCP OAuth state: %d clients, %d access tokens, %d refresh tokens",
-            len(self.clients),
-            len(self.access_tokens),
-            len(self.refresh_tokens),
-        )
-        self._persist_oauth_state_unlocked()
-
-    def _serialize_client(self, c: OAuthClientInformationFull) -> dict:
-        return c.model_dump(mode="json")
-
-    def _serialize_access(self, at: AccessToken) -> dict:
-        return {
-            "token": at.token,
-            "client_id": at.client_id,
-            "scopes": at.scopes,
-            "expires_at": at.expires_at,
-            "resource": getattr(at, "resource", None),
-            "claims": getattr(at, "claims", None) or {},
-        }
-
-    def _serialize_refresh(self, rt: RefreshToken) -> dict:
-        return {
-            "token": rt.token,
-            "client_id": rt.client_id,
-            "scopes": rt.scopes,
-            "expires_at": rt.expires_at,
-        }
-
-    def _persist_oauth_state_unlocked(self) -> None:
-        path = self._oauth_state_path
-        payload = {
-            "version": 1,
-            "saved_at": int(time.time()),
-            "clients": {cid: self._serialize_client(c) for cid, c in self.clients.items()},
-            "access_tokens": {
-                t: self._serialize_access(at) for t, at in self.access_tokens.items()
-            },
-            "refresh_tokens": {
-                t: self._serialize_refresh(rt) for t, rt in self.refresh_tokens.items()
-            },
-            "token_to_email": dict(self.token_to_email),
-        }
-        directory = os.path.dirname(path) or "."
-        try:
-            if directory != ".":
-                os.makedirs(directory, mode=0o700, exist_ok=True)
-            fd, tmp_path = tempfile.mkstemp(
-                dir=directory, prefix="mcp_oauth_", suffix=".tmp"
-            )
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as wf:
-                    json.dump(payload, wf, indent=2)
-                os.chmod(tmp_path, 0o600)
-                os.replace(tmp_path, path)
-            except Exception:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-                raise
-        except Exception as e:
-            logger.error("Failed to persist MCP OAuth state to %s: %s", path, e)
 
     # ------------------------------------------------------------------
     # Client registration
@@ -264,9 +103,7 @@ class GoogleOAuthProvider(OAuthProvider):
         return self.clients.get(client_id)
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
-        async with self._oauth_lock:
-            self.clients[client_info.client_id] = client_info
-            self._persist_oauth_state_unlocked()
+        self.clients[client_info.client_id] = client_info
         logger.info("Registered MCP client: %s", client_info.client_id)
 
     # ------------------------------------------------------------------
@@ -517,33 +354,30 @@ class GoogleOAuthProvider(OAuthProvider):
     async def exchange_authorization_code(
         self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
     ) -> OAuthToken:
-        async with self._oauth_lock:
-            self.auth_codes.pop(authorization_code.code, None)
-            user_email = self.auth_code_to_email.pop(authorization_code.code, None)
+        self.auth_codes.pop(authorization_code.code, None)
+        user_email = self.auth_code_to_email.pop(authorization_code.code, None)
 
-            access_token_value = secrets.token_urlsafe(32)
-            refresh_token_value = secrets.token_urlsafe(32)
-            expires_at = int(time.time()) + self._access_ttl
+        access_token_value = secrets.token_urlsafe(32)
+        refresh_token_value = secrets.token_urlsafe(32)
+        expires_at = int(time.time()) + DEFAULT_ACCESS_TOKEN_EXPIRY
 
-            self.access_tokens[access_token_value] = AccessToken(
-                token=access_token_value,
-                client_id=client.client_id,
-                scopes=authorization_code.scopes,
-                expires_at=expires_at,
-                claims={"email": user_email},
-            )
+        self.access_tokens[access_token_value] = AccessToken(
+            token=access_token_value,
+            client_id=client.client_id,
+            scopes=authorization_code.scopes,
+            expires_at=expires_at,
+            claims={"email": user_email},
+        )
 
-            self.refresh_tokens[refresh_token_value] = RefreshToken(
-                token=refresh_token_value,
-                client_id=client.client_id,
-                scopes=authorization_code.scopes,
-                expires_at=int(time.time()) + self._refresh_ttl,
-            )
+        self.refresh_tokens[refresh_token_value] = RefreshToken(
+            token=refresh_token_value,
+            client_id=client.client_id,
+            scopes=authorization_code.scopes,
+            expires_at=int(time.time()) + DEFAULT_REFRESH_TOKEN_EXPIRY,
+        )
 
-            self.token_to_email[access_token_value] = user_email
-            self.token_to_email[refresh_token_value] = user_email
-
-            self._persist_oauth_state_unlocked()
+        self.token_to_email[access_token_value] = user_email
+        self.token_to_email[refresh_token_value] = user_email
 
         logger.info(
             "Issued MCP tokens for user=%s (client=%s)", user_email, client.client_id
@@ -552,7 +386,7 @@ class GoogleOAuthProvider(OAuthProvider):
         return OAuthToken(
             access_token=access_token_value,
             token_type="Bearer",
-            expires_in=self._access_ttl,
+            expires_in=DEFAULT_ACCESS_TOKEN_EXPIRY,
             refresh_token=refresh_token_value,
             scope=" ".join(authorization_code.scopes),
         )
@@ -564,18 +398,16 @@ class GoogleOAuthProvider(OAuthProvider):
     async def load_refresh_token(
         self, client: OAuthClientInformationFull, refresh_token: str
     ) -> Optional[RefreshToken]:
-        async with self._oauth_lock:
-            rt = self.refresh_tokens.get(refresh_token)
-            if not rt:
-                return None
-            if rt.client_id != client.client_id:
-                return None
-            if rt.expires_at is not None and rt.expires_at < time.time():
-                self.refresh_tokens.pop(refresh_token, None)
-                self.token_to_email.pop(refresh_token, None)
-                self._persist_oauth_state_unlocked()
-                return None
-            return rt
+        rt = self.refresh_tokens.get(refresh_token)
+        if not rt:
+            return None
+        if rt.client_id != client.client_id:
+            return None
+        if rt.expires_at is not None and rt.expires_at < time.time():
+            self.refresh_tokens.pop(refresh_token, None)
+            self.token_to_email.pop(refresh_token, None)
+            return None
+        return rt
 
     async def exchange_refresh_token(
         self,
@@ -583,47 +415,43 @@ class GoogleOAuthProvider(OAuthProvider):
         refresh_token: RefreshToken,
         scopes: list[str],
     ) -> OAuthToken:
-        user_email: Optional[str] = None
-        new_access: str = ""
-        new_refresh: str = ""
-        async with self._oauth_lock:
-            user_email = self.token_to_email.get(refresh_token.token)
+        user_email = self.token_to_email.get(refresh_token.token)
 
-            self.refresh_tokens.pop(refresh_token.token, None)
-            self.token_to_email.pop(refresh_token.token, None)
-
-            new_access = secrets.token_urlsafe(32)
-            new_refresh = secrets.token_urlsafe(32)
-            expires_at = int(time.time()) + self._access_ttl
-
-            self.access_tokens[new_access] = AccessToken(
-                token=new_access,
-                client_id=client.client_id,
-                scopes=scopes,
-                expires_at=expires_at,
-                claims={"email": user_email},
-            )
-            self.refresh_tokens[new_refresh] = RefreshToken(
-                token=new_refresh,
-                client_id=client.client_id,
-                scopes=scopes,
-                expires_at=int(time.time()) + self._refresh_ttl,
-            )
-
-            self.token_to_email[new_access] = user_email
-            self.token_to_email[new_refresh] = user_email
-
-            self._persist_oauth_state_unlocked()
-
+        # Also refresh the underlying Google token if we have a refresh_token
         if user_email:
             self._try_refresh_google_token(user_email)
+
+        # Rotate MCP tokens
+        self.refresh_tokens.pop(refresh_token.token, None)
+        self.token_to_email.pop(refresh_token.token, None)
+
+        new_access = secrets.token_urlsafe(32)
+        new_refresh = secrets.token_urlsafe(32)
+        expires_at = int(time.time()) + DEFAULT_ACCESS_TOKEN_EXPIRY
+
+        self.access_tokens[new_access] = AccessToken(
+            token=new_access,
+            client_id=client.client_id,
+            scopes=scopes,
+            expires_at=expires_at,
+            claims={"email": user_email},
+        )
+        self.refresh_tokens[new_refresh] = RefreshToken(
+            token=new_refresh,
+            client_id=client.client_id,
+            scopes=scopes,
+            expires_at=int(time.time()) + DEFAULT_REFRESH_TOKEN_EXPIRY,
+        )
+
+        self.token_to_email[new_access] = user_email
+        self.token_to_email[new_refresh] = user_email
 
         logger.info("Rotated MCP tokens for user=%s", user_email)
 
         return OAuthToken(
             access_token=new_access,
             token_type="Bearer",
-            expires_in=self._access_ttl,
+            expires_in=DEFAULT_ACCESS_TOKEN_EXPIRY,
             refresh_token=new_refresh,
             scope=" ".join(scopes),
         )
@@ -646,16 +474,14 @@ class GoogleOAuthProvider(OAuthProvider):
     # ------------------------------------------------------------------
 
     async def load_access_token(self, token: str) -> Optional[AccessToken]:
-        async with self._oauth_lock:
-            at = self.access_tokens.get(token)
-            if not at:
-                return None
-            if at.expires_at is not None and at.expires_at < time.time():
-                self.access_tokens.pop(token, None)
-                self.token_to_email.pop(token, None)
-                self._persist_oauth_state_unlocked()
-                return None
-            return at
+        at = self.access_tokens.get(token)
+        if not at:
+            return None
+        if at.expires_at is not None and at.expires_at < time.time():
+            self.access_tokens.pop(token, None)
+            self.token_to_email.pop(token, None)
+            return None
+        return at
 
     async def verify_token(self, token: str) -> Optional[AccessToken]:
         return await self.load_access_token(token)
@@ -665,14 +491,12 @@ class GoogleOAuthProvider(OAuthProvider):
     # ------------------------------------------------------------------
 
     async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
-        async with self._oauth_lock:
-            if isinstance(token, AccessToken):
-                self.access_tokens.pop(token.token, None)
-                self.token_to_email.pop(token.token, None)
-            elif isinstance(token, RefreshToken):
-                self.refresh_tokens.pop(token.token, None)
-                self.token_to_email.pop(token.token, None)
-            self._persist_oauth_state_unlocked()
+        if isinstance(token, AccessToken):
+            self.access_tokens.pop(token.token, None)
+            self.token_to_email.pop(token.token, None)
+        elif isinstance(token, RefreshToken):
+            self.refresh_tokens.pop(token.token, None)
+            self.token_to_email.pop(token.token, None)
 
     # ------------------------------------------------------------------
     # Routes: add /oauth2callback alongside standard OAuth routes
