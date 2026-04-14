@@ -184,6 +184,45 @@ async def _sa_query_all(service, site_url: str, base_body: Dict[str, Any], max_r
             break
     return rows
 
+
+async def _sa_query_map_covering_keys(
+    service,
+    site_url: str,
+    base_body: Dict[str, Any],
+    required_keys: set,
+    max_rows_scanned: int,
+) -> Dict[tuple, Dict[str, Any]]:
+    """Page through Search Analytics until each required key has a row or the scan budget is exhausted."""
+    found: Dict[tuple, Dict[str, Any]] = {}
+    start_row = int(base_body.get("startRow", 0) or 0)
+    page_size = min(int(base_body.get("rowLimit", GSC_SA_PAGE_SIZE) or GSC_SA_PAGE_SIZE), 25000)
+    scanned = 0
+    budget = int(max_rows_scanned)
+    while scanned < budget:
+        body = dict(base_body)
+        body["startRow"] = start_row
+        body["rowLimit"] = min(page_size, budget - scanned)
+        if int(body["rowLimit"]) <= 0:
+            break
+        resp = await _execute_with_retries(
+            lambda b=body: service.searchanalytics().query(siteUrl=site_url, body=b).execute()
+        )
+        page_rows = resp.get("rows", [])
+        if not page_rows:
+            break
+        for r in page_rows:
+            k = tuple(r.get("keys", []))
+            if k in required_keys:
+                found[k] = r
+        scanned += len(page_rows)
+        start_row += len(page_rows)
+        if len(found) >= len(required_keys):
+            break
+        if len(page_rows) < int(body["rowLimit"]):
+            break
+    return found
+
+
 # --- Property resolution helpers ---
 
 def _list_property_urls(service) -> List[str]:
@@ -1466,6 +1505,14 @@ async def compare_search_periods(
     dimensions: str = "query",
     limit: int = 10,
     auto_paginate: Optional[bool] = None,
+    filter_dimension: Optional[str] = None,
+    filter_operator: str = "contains",
+    filter_expression: Optional[str] = None,
+    additional_filters: Optional[str] = None,
+    focus_top_queries_period: Optional[str] = None,
+    focus_top_queries_n: int = 100,
+    focus_rank_by: str = "impressions",
+    sort_deltas_by: str = "impressions_delta_asc",
 ) -> str:
     """
     Compare search analytics data between two time periods.
@@ -1477,8 +1524,20 @@ async def compare_search_periods(
         period2_start: Start date for period 2 (YYYY-MM-DD)
         period2_end: End date for period 2 (YYYY-MM-DD)
         dimensions: Dimensions to group by (default: query)
-        limit: Number of top results to compare (default: 10)
+        limit: Max rows to print after sorting (default: 10)
         auto_paginate: If true, fetches all pages up to the global max. Defaults to env GSC_AUTO_PAGINATE_DEFAULT.
+            Ignored when focus_top_queries_period is set (focus mode uses targeted fetches).
+        filter_dimension: Optional GSC dimension to filter (query, page, country, device, ...)
+        filter_operator: Filter operator (contains, equals, notContains, notEquals)
+        filter_expression: Value for the primary filter
+        additional_filters: JSON list of extra filters, e.g. [{"dimension":"query","operator":"contains","expression":"foo"}]
+        focus_top_queries_period: If "period1" or "period2", only compares the top focus_top_queries_n rows
+            from that period ordered by focus_rank_by DESC (useful for week-over-week drop analysis on top queries).
+        focus_top_queries_n: How many top rows to take from the focus period (default 100)
+        focus_rank_by: Metric to rank the focus period by: impressions, clicks, ctr, position
+        sort_deltas_by: How to order printed rows: impressions_delta_asc, impressions_delta_desc,
+            clicks_delta_asc, clicks_delta_desc, period1_impressions_desc, period1_clicks_desc,
+            period2_impressions_desc, period2_clicks_desc
     """
     try:
         service = get_gsc_service(_get_authenticated_user_email())
@@ -1486,45 +1545,126 @@ async def compare_search_periods(
         
         # Parse dimensions
         dimension_list = [d.strip() for d in dimensions.split(",")]
+
+        filters: List[Dict[str, Any]] = []
+        if filter_dimension and filter_expression:
+            filters.append({
+                "dimension": filter_dimension,
+                "operator": filter_operator,
+                "expression": filter_expression,
+            })
+        if additional_filters:
+            try:
+                extra = json.loads(additional_filters)
+                if isinstance(extra, list):
+                    for f in extra:
+                        if isinstance(f, dict) and "dimension" in f and "expression" in f:
+                            filters.append({
+                                "dimension": f["dimension"],
+                                "operator": f.get("operator", "contains"),
+                                "expression": f["expression"],
+                            })
+            except json.JSONDecodeError:
+                pass
+        filter_groups = [{"filters": filters}] if filters else None
         
         # Build requests for both periods
-        period1_request = {
+        period1_request: Dict[str, Any] = {
             "startDate": period1_start,
             "endDate": period1_end,
             "dimensions": dimension_list,
             "rowLimit": 1000  # Default page size if not auto-paginating
         }
         
-        period2_request = {
+        period2_request: Dict[str, Any] = {
             "startDate": period2_start,
             "endDate": period2_end,
             "dimensions": dimension_list,
             "rowLimit": 1000
         }
-        
-        # Execute requests (optionally auto-paginate)
-        effective_auto = GSC_AUTO_PAGINATE_DEFAULT if auto_paginate is None else bool(auto_paginate)
-        if effective_auto:
-            period1_rows = await _sa_query_all(service, site_url, period1_request, GSC_AUTO_PAGINATE_MAX_ROWS)
-            period2_rows = await _sa_query_all(service, site_url, period2_request, GSC_AUTO_PAGINATE_MAX_ROWS)
-        else:
-            period1_response = service.searchanalytics().query(siteUrl=site_url, body=period1_request).execute()
-            period2_response = service.searchanalytics().query(siteUrl=site_url, body=period2_request).execute()
-            period1_rows = period1_response.get("rows", [])
-            period2_rows = period2_response.get("rows", [])
-        
-        if not period1_rows and not period2_rows:
-            return f"No data found for either period for {site_url}."
-        
-        # Aggregate by keys for comparison
-        def to_key(row):
+        if filter_groups:
+            period1_request["dimensionFilterGroups"] = filter_groups
+            period2_request["dimensionFilterGroups"] = filter_groups
+
+        def to_key(row: Dict[str, Any]) -> tuple:
             return tuple(row.get("keys", []))
-        
-        p1_map: Dict[Any, Dict[str, Any]] = {to_key(r): r for r in period1_rows}
-        p2_map: Dict[Any, Dict[str, Any]] = {to_key(r): r for r in period2_rows}
-        
+
+        focus = (focus_top_queries_period or "").strip().lower() or None
+        if focus and focus not in ("period1", "period2"):
+            return "Error: focus_top_queries_period must be 'period1', 'period2', or omitted."
+
+        metric_map = {
+            "impressions": "impressions",
+            "clicks": "clicks",
+            "ctr": "ctr",
+            "position": "position",
+        }
+        rank_metric = (focus_rank_by or "impressions").strip().lower()
+        if rank_metric not in metric_map:
+            return f"Error: focus_rank_by must be one of {', '.join(metric_map.keys())}"
+
+        p1_map: Dict[Any, Dict[str, Any]]
+        p2_map: Dict[Any, Dict[str, Any]]
+
+        if focus:
+            n = max(1, int(focus_top_queries_n))
+            order_field = metric_map[rank_metric]
+            scan_budget = GSC_AUTO_PAGINATE_MAX_ROWS
+
+            if focus == "period1":
+                req_anchor = dict(period1_request)
+                req_anchor["orderBy"] = [{"field": order_field, "descending": True}]
+                req_anchor["rowLimit"] = min(GSC_SA_PAGE_SIZE, 25000)
+                anchor_rows = await _sa_query_all(service, site_url, req_anchor, max_rows=n)
+                sel_keys = {to_key(r) for r in anchor_rows[:n]}
+                p1_map = {to_key(r): r for r in anchor_rows[:n]}
+                req_other = dict(period2_request)
+                req_other["rowLimit"] = min(GSC_SA_PAGE_SIZE, 25000)
+                p2_map = await _sa_query_map_covering_keys(
+                    service, site_url, req_other, sel_keys, scan_budget
+                )
+            else:
+                req_anchor = dict(period2_request)
+                req_anchor["orderBy"] = [{"field": order_field, "descending": True}]
+                req_anchor["rowLimit"] = min(GSC_SA_PAGE_SIZE, 25000)
+                anchor_rows = await _sa_query_all(service, site_url, req_anchor, max_rows=n)
+                sel_keys = {to_key(r) for r in anchor_rows[:n]}
+                p2_map = {to_key(r): r for r in anchor_rows[:n]}
+                req_other = dict(period1_request)
+                req_other["rowLimit"] = min(GSC_SA_PAGE_SIZE, 25000)
+                p1_map = await _sa_query_map_covering_keys(
+                    service, site_url, req_other, sel_keys, scan_budget
+                )
+            all_keys = sel_keys
+        else:
+            # Execute requests (optionally auto-paginate)
+            effective_auto = GSC_AUTO_PAGINATE_DEFAULT if auto_paginate is None else bool(auto_paginate)
+            if effective_auto:
+                period1_rows = await _sa_query_all(service, site_url, period1_request, GSC_AUTO_PAGINATE_MAX_ROWS)
+                period2_rows = await _sa_query_all(service, site_url, period2_request, GSC_AUTO_PAGINATE_MAX_ROWS)
+            else:
+                period1_rows = (
+                    await _execute_with_retries(
+                        lambda: service.searchanalytics().query(siteUrl=site_url, body=period1_request).execute()
+                    )
+                ).get("rows", [])
+                period2_rows = (
+                    await _execute_with_retries(
+                        lambda: service.searchanalytics().query(siteUrl=site_url, body=period2_request).execute()
+                    )
+                ).get("rows", [])
+
+            if not period1_rows and not period2_rows:
+                return f"No data found for either period for {site_url}."
+
+            p1_map = {to_key(r): r for r in period1_rows}
+            p2_map = {to_key(r): r for r in period2_rows}
+            all_keys = set(p1_map.keys()) | set(p2_map.keys())
+
+        if not all_keys:
+            return f"No data found for either period for {site_url}."
+
         # Compute deltas
-        all_keys = set(p1_map.keys()) | set(p2_map.keys())
         deltas = []
         for k in all_keys:
             r1 = p1_map.get(k, {})
@@ -1534,16 +1674,42 @@ async def compare_search_periods(
             ctr_delta = float(r2.get("ctr", 0)) - float(r1.get("ctr", 0))
             pos_delta = float(r2.get("position", 0)) - float(r1.get("position", 0))
             deltas.append((k, clicks_delta, impr_delta, ctr_delta, pos_delta, r1, r2))
-        
-        # Sort by impressions delta asc (drops first)
-        deltas.sort(key=lambda x: x[2])
+
+        mode = (sort_deltas_by or "impressions_delta_asc").strip().lower()
+        if mode == "impressions_delta_asc":
+            deltas.sort(key=lambda x: x[2])
+        elif mode == "impressions_delta_desc":
+            deltas.sort(key=lambda x: x[2], reverse=True)
+        elif mode == "clicks_delta_asc":
+            deltas.sort(key=lambda x: x[1])
+        elif mode == "clicks_delta_desc":
+            deltas.sort(key=lambda x: x[1], reverse=True)
+        elif mode == "period1_impressions_desc":
+            deltas.sort(key=lambda x: float((x[5] or {}).get("impressions", 0) or 0), reverse=True)
+        elif mode == "period1_clicks_desc":
+            deltas.sort(key=lambda x: float((x[5] or {}).get("clicks", 0) or 0), reverse=True)
+        elif mode == "period2_impressions_desc":
+            deltas.sort(key=lambda x: float((x[6] or {}).get("impressions", 0) or 0), reverse=True)
+        elif mode == "period2_clicks_desc":
+            deltas.sort(key=lambda x: float((x[6] or {}).get("clicks", 0) or 0), reverse=True)
+        else:
+            deltas.sort(key=lambda x: x[2])
         
         # Format output
         lines = [
             f"Comparison for {site_url}",
             f"Period 1: {period1_start} to {period1_end} | Period 2: {period2_start} to {period2_end}",
-            "\nKeys | ClicksΔ | ImprΔ | CTRΔ | PosΔ | P1(clicks,impr,ctr,pos) | P2(clicks,impr,ctr,pos)"
         ]
+        if filters:
+            desc = [f"{f['dimension']} {f['operator']} '{f['expression']}'" for f in filters]
+            lines.append("Filters: " + " AND ".join(desc))
+        if focus:
+            lines.append(
+                f"Focus: top {min(len(deltas), n)} keys from {focus} by {rank_metric} DESC "
+                f"(other period scanned up to {GSC_AUTO_PAGINATE_MAX_ROWS} rows to match keys)"
+            )
+        lines.append(f"Sort: {mode}")
+        lines.append("\nKeys | ClicksΔ | ImprΔ | CTRΔ | PosΔ | P1(clicks,impr,ctr,pos) | P2(clicks,impr,ctr,pos)")
         count = 0
         for k, cΔ, iΔ, ctrΔ, pΔ, r1, r2 in deltas:
             dims = " / ".join([str(x) for x in k]) if k else "(total)"
