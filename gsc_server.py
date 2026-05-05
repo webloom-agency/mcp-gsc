@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 import os
 import json
 import logging
@@ -16,6 +16,7 @@ import httplib2
 import google_auth_httplib2
 import asyncio
 import random
+import threading
 
 # MCP
 from fastmcp import FastMCP
@@ -163,7 +164,60 @@ async def _execute_with_retries_cfg(
             await asyncio.sleep(backoff + random.uniform(0, max(0, jitter) / 1000.0))
     raise last_exc
 
-async def _sa_query_all(service, site_url: str, base_body: Dict[str, Any], max_rows: Optional[int] = None) -> List[Dict[str, Any]]:
+_thread_local_gsc = threading.local()
+
+
+def get_gsc_service_thread_local(user_email: Optional[str] = None) -> Any:
+    """
+    Per-thread Search Console API client.
+
+    googleapiclient is built on httplib2, which is not thread-safe. asyncio.to_thread
+    runs requests on a thread pool; sharing one service across threads corrupts the
+    heap (SIGABRT 134 / SIGSEGV 139, \"double free\") under concurrent load.
+    """
+    cache: Optional[Dict[str, Any]] = getattr(_thread_local_gsc, "clients", None)
+    if cache is None:
+        cache = {}
+        _thread_local_gsc.clients = cache
+    key = user_email if user_email is not None else "__default__"
+    if key not in cache:
+        cache[key] = get_gsc_service(user_email)
+    return cache[key]
+
+
+def _gsc_build_execute(user_email: Optional[str], builder: Callable[[Any], Any]) -> Any:
+    """Run builder(service).execute() using a thread-local service (builder returns a Google API request)."""
+    svc = get_gsc_service_thread_local(user_email)
+    return builder(svc).execute()
+
+
+async def _execute_with_retries_gsc(user_email: Optional[str], builder: Callable[[Any], Any]):
+    return await _execute_with_retries(lambda: _gsc_build_execute(user_email, builder))
+
+
+async def _execute_with_retries_cfg_gsc(
+    user_email: Optional[str],
+    builder: Callable[[Any], Any],
+    retries: Optional[int] = None,
+    base_backoff_seconds: Optional[float] = None,
+    jitter_ms: Optional[int] = None,
+    max_backoff_seconds: Optional[float] = None,
+):
+    return await _execute_with_retries_cfg(
+        lambda: _gsc_build_execute(user_email, builder),
+        retries=retries,
+        base_backoff_seconds=base_backoff_seconds,
+        jitter_ms=jitter_ms,
+        max_backoff_seconds=max_backoff_seconds,
+    )
+
+
+async def _sa_query_all(
+    user_email: Optional[str],
+    site_url: str,
+    base_body: Dict[str, Any],
+    max_rows: Optional[int] = None,
+) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     start_row = int(base_body.get("startRow", 0) or 0)
     page_size = min(int(base_body.get("rowLimit", GSC_SA_PAGE_SIZE) or GSC_SA_PAGE_SIZE), 25000)
@@ -171,7 +225,10 @@ async def _sa_query_all(service, site_url: str, base_body: Dict[str, Any], max_r
         body = dict(base_body)
         body["startRow"] = start_row
         body["rowLimit"] = page_size
-        resp = await _execute_with_retries(lambda: service.searchanalytics().query(siteUrl=site_url, body=body).execute())
+        resp = await _execute_with_retries_gsc(
+            user_email,
+            lambda svc, b=body: svc.searchanalytics().query(siteUrl=site_url, body=b),
+        )
         page_rows = resp.get("rows", [])
         if not page_rows:
             break
@@ -186,7 +243,7 @@ async def _sa_query_all(service, site_url: str, base_body: Dict[str, Any], max_r
 
 
 async def _sa_query_map_covering_keys(
-    service,
+    user_email: Optional[str],
     site_url: str,
     base_body: Dict[str, Any],
     required_keys: set,
@@ -204,8 +261,9 @@ async def _sa_query_map_covering_keys(
         body["rowLimit"] = min(page_size, budget - scanned)
         if int(body["rowLimit"]) <= 0:
             break
-        resp = await _execute_with_retries(
-            lambda b=body: service.searchanalytics().query(siteUrl=site_url, body=b).execute()
+        resp = await _execute_with_retries_gsc(
+            user_email,
+            lambda svc, b=body: svc.searchanalytics().query(siteUrl=site_url, body=b),
         )
         page_rows = resp.get("rows", [])
         if not page_rows:
@@ -593,7 +651,8 @@ async def get_search_analytics(site_url: str, days: int = 28, dimensions: str = 
         auto_paginate: If true, fetches all pages up to the global max. Defaults to env GSC_AUTO_PAGINATE_DEFAULT.
     """
     try:
-        service = get_gsc_service(_get_authenticated_user_email())
+        user_email = _get_authenticated_user_email()
+        service = get_gsc_service(user_email)
         site_url = _resolve_site_url(service, site_url)
         
         # Calculate date range
@@ -618,7 +677,7 @@ async def get_search_analytics(site_url: str, days: int = 28, dimensions: str = 
         if effective_auto:
             # Ensure per-page size is reasonable; API may cap per-call rows
             request["rowLimit"] = min(desired_total, GSC_SA_PAGE_SIZE)
-            rows = await _sa_query_all(service, site_url, request, max_rows=desired_total)
+            rows = await _sa_query_all(user_email, site_url, request, max_rows=desired_total)
         else:
             response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
             rows = response.get("rows", [])
@@ -895,7 +954,8 @@ async def inspect_url_enhanced(site_url: str, page_url: str) -> str:
     try:
         await INSPECTION_SEMAPHORE.acquire()
         try:
-            service = get_gsc_service(_get_authenticated_user_email())
+            user_email = _get_authenticated_user_email()
+            service = get_gsc_service(user_email)
             site_url = _resolve_site_url(service, site_url)
             
             # Build request
@@ -904,8 +964,11 @@ async def inspect_url_enhanced(site_url: str, page_url: str) -> str:
                 "siteUrl": site_url
             }
             
-            # Execute request
-            response = await _execute_with_retries(lambda: service.urlInspection().index().inspect(body=request).execute())
+            # Execute request (thread-local client: shared httplib2 is not thread-safe under to_thread)
+            response = await _execute_with_retries_gsc(
+                user_email,
+                lambda svc, r=request: svc.urlInspection().index().inspect(body=r),
+            )
             
             if not response or "inspectionResult" not in response:
                 return f"No inspection data found for {page_url}."
@@ -950,7 +1013,8 @@ async def batch_url_inspection(
     try:
         await INSPECTION_SEMAPHORE.acquire()
         try:
-            service = get_gsc_service(_get_authenticated_user_email())
+            user_email = _get_authenticated_user_email()
+            service = get_gsc_service(user_email)
             site_url = _resolve_site_url(service, site_url)
 
             url_list = [url.strip() for url in urls.split("\n") if url.strip()]
@@ -970,8 +1034,9 @@ async def batch_url_inspection(
                     async with sem:
                         request = {"inspectionUrl": page_url, "siteUrl": site_url}
                         try:
-                            response = await _execute_with_retries_cfg(
-                                lambda: service.urlInspection().index().inspect(body=request).execute(),
+                            response = await _execute_with_retries_cfg_gsc(
+                                user_email,
+                                lambda svc, r=request: svc.urlInspection().index().inspect(body=r),
                                 retries=retries,
                                 base_backoff_seconds=backoff_seconds,
                                 jitter_ms=jitter_ms,
@@ -1041,7 +1106,8 @@ async def check_indexing_issues(
     try:
         await INSPECTION_SEMAPHORE.acquire()
         try:
-            service = get_gsc_service(_get_authenticated_user_email())
+            user_email = _get_authenticated_user_email()
+            service = get_gsc_service(user_email)
             site_url = _resolve_site_url(service, site_url)
 
             url_list = [url.strip() for url in urls.split("\n") if url.strip()]
@@ -1062,8 +1128,9 @@ async def check_indexing_issues(
                     async with sem:
                         request = {"inspectionUrl": page_url, "siteUrl": site_url}
                         try:
-                            response = await _execute_with_retries_cfg(
-                                lambda: service.urlInspection().index().inspect(body=request).execute(),
+                            response = await _execute_with_retries_cfg_gsc(
+                                user_email,
+                                lambda svc, r=request: svc.urlInspection().index().inspect(body=r),
                                 retries=retries,
                                 base_backoff_seconds=backoff_seconds,
                                 jitter_ms=jitter_ms,
@@ -1192,7 +1259,8 @@ async def get_top_pages_with_indexing(
     try:
         await INSPECTION_SEMAPHORE.acquire()
         try:
-            service = get_gsc_service(_get_authenticated_user_email())
+            user_email = _get_authenticated_user_email()
+            service = get_gsc_service(user_email)
             site_url = _resolve_site_url(service, site_url)
             end_date = datetime.now().date()
             start_date = end_date - timedelta(days=days)
@@ -1231,8 +1299,9 @@ async def get_top_pages_with_indexing(
                 async with sem:
                     request = {"inspectionUrl": p["url"], "siteUrl": site_url}
                     try:
-                        resp = await _execute_with_retries_cfg(
-                            lambda: service.urlInspection().index().inspect(body=request).execute(),
+                        resp = await _execute_with_retries_cfg_gsc(
+                            user_email,
+                            lambda svc, r=request: svc.urlInspection().index().inspect(body=r),
                             retries=retries,
                             base_backoff_seconds=backoff_seconds,
                             jitter_ms=jitter_ms,
@@ -1424,7 +1493,8 @@ async def get_advanced_search_analytics(
         auto_paginate: If true, fetches all pages up to the global max. Defaults to env GSC_AUTO_PAGINATE_DEFAULT.
     """
     try:
-        service = get_gsc_service(_get_authenticated_user_email())
+        user_email = _get_authenticated_user_email()
+        service = get_gsc_service(user_email)
         site_url = _resolve_site_url(service, site_url)
         
         # Calculate date range if not provided
@@ -1498,7 +1568,7 @@ async def get_advanced_search_analytics(
         if effective_auto:
             # Respect desired_total when auto-paginating
             request["rowLimit"] = min(desired_total, GSC_SA_PAGE_SIZE)
-            rows = await _sa_query_all(service, site_url, request, max_rows=desired_total)
+            rows = await _sa_query_all(user_email, site_url, request, max_rows=desired_total)
         else:
             response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
             rows = response.get("rows", [])
@@ -1617,7 +1687,8 @@ async def compare_search_periods(
             period2_impressions_desc, period2_clicks_desc
     """
     try:
-        service = get_gsc_service(_get_authenticated_user_email())
+        user_email = _get_authenticated_user_email()
+        service = get_gsc_service(user_email)
         site_url = _resolve_site_url(service, site_url)
         
         # Parse dimensions
@@ -1692,42 +1763,44 @@ async def compare_search_periods(
                 req_anchor = dict(period1_request)
                 req_anchor["orderBy"] = [{"field": order_field, "descending": True}]
                 req_anchor["rowLimit"] = min(GSC_SA_PAGE_SIZE, 25000)
-                anchor_rows = await _sa_query_all(service, site_url, req_anchor, max_rows=n)
+                anchor_rows = await _sa_query_all(user_email, site_url, req_anchor, max_rows=n)
                 sel_keys = {to_key(r) for r in anchor_rows[:n]}
                 p1_map = {to_key(r): r for r in anchor_rows[:n]}
                 req_other = dict(period2_request)
                 req_other["rowLimit"] = min(GSC_SA_PAGE_SIZE, 25000)
                 p2_map = await _sa_query_map_covering_keys(
-                    service, site_url, req_other, sel_keys, scan_budget
+                    user_email, site_url, req_other, sel_keys, scan_budget
                 )
             else:
                 req_anchor = dict(period2_request)
                 req_anchor["orderBy"] = [{"field": order_field, "descending": True}]
                 req_anchor["rowLimit"] = min(GSC_SA_PAGE_SIZE, 25000)
-                anchor_rows = await _sa_query_all(service, site_url, req_anchor, max_rows=n)
+                anchor_rows = await _sa_query_all(user_email, site_url, req_anchor, max_rows=n)
                 sel_keys = {to_key(r) for r in anchor_rows[:n]}
                 p2_map = {to_key(r): r for r in anchor_rows[:n]}
                 req_other = dict(period1_request)
                 req_other["rowLimit"] = min(GSC_SA_PAGE_SIZE, 25000)
                 p1_map = await _sa_query_map_covering_keys(
-                    service, site_url, req_other, sel_keys, scan_budget
+                    user_email, site_url, req_other, sel_keys, scan_budget
                 )
             all_keys = sel_keys
         else:
             # Execute requests (optionally auto-paginate)
             effective_auto = GSC_AUTO_PAGINATE_DEFAULT if auto_paginate is None else bool(auto_paginate)
             if effective_auto:
-                period1_rows = await _sa_query_all(service, site_url, period1_request, GSC_AUTO_PAGINATE_MAX_ROWS)
-                period2_rows = await _sa_query_all(service, site_url, period2_request, GSC_AUTO_PAGINATE_MAX_ROWS)
+                period1_rows = await _sa_query_all(user_email, site_url, period1_request, GSC_AUTO_PAGINATE_MAX_ROWS)
+                period2_rows = await _sa_query_all(user_email, site_url, period2_request, GSC_AUTO_PAGINATE_MAX_ROWS)
             else:
                 period1_rows = (
-                    await _execute_with_retries(
-                        lambda: service.searchanalytics().query(siteUrl=site_url, body=period1_request).execute()
+                    await _execute_with_retries_gsc(
+                        user_email,
+                        lambda svc: svc.searchanalytics().query(siteUrl=site_url, body=period1_request),
                     )
                 ).get("rows", [])
                 period2_rows = (
-                    await _execute_with_retries(
-                        lambda: service.searchanalytics().query(siteUrl=site_url, body=period2_request).execute()
+                    await _execute_with_retries_gsc(
+                        user_email,
+                        lambda svc: svc.searchanalytics().query(siteUrl=site_url, body=period2_request),
                     )
                 ).get("rows", [])
 
