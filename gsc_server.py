@@ -1650,7 +1650,7 @@ async def compare_search_periods(
     period2_start: str,
     period2_end: str,
     dimensions: str = "query",
-    limit: int = 10,
+    limit: Optional[int] = None,
     auto_paginate: Optional[bool] = None,
     filter_dimension: Optional[str] = None,
     filter_operator: str = "contains",
@@ -1671,8 +1671,11 @@ async def compare_search_periods(
         period2_start: Start date for period 2 (YYYY-MM-DD)
         period2_end: End date for period 2 (YYYY-MM-DD)
         dimensions: Dimensions to group by (default: query)
-        limit: Max rows to print after sorting (default: 10)
-        auto_paginate: If true, fetches all pages up to the global max. Defaults to env GSC_AUTO_PAGINATE_DEFAULT.
+        limit: Max rows to print after sorting. Use None (default), 0, or a negative value to print
+            ALL rows (no truncation). When a positive limit is given and more rows exist, an explicit
+            "showing N of M" note is printed so truncation is never silent.
+        auto_paginate: If true, fetches all pages up to the global max. When None (default) this tool
+            auto-paginates so both periods are fetched completely (required for correct deltas/totals).
             Ignored when focus_top_queries_period is set (focus mode uses targeted fetches).
         filter_dimension: Optional GSC dimension to filter (query, page, country, device, ...)
         filter_operator: Filter operator (contains, equals, notContains, notEquals)
@@ -1785,8 +1788,11 @@ async def compare_search_periods(
                 )
             all_keys = sel_keys
         else:
-            # Execute requests (optionally auto-paginate)
-            effective_auto = GSC_AUTO_PAGINATE_DEFAULT if auto_paginate is None else bool(auto_paginate)
+            # Execute requests (optionally auto-paginate).
+            # Default to auto-paginate when the caller doesn't specify: comparisons compute deltas and
+            # totals across the union of keys from BOTH periods, so a single truncated page would
+            # silently understate totals on longer ranges / high-cardinality dimensions.
+            effective_auto = True if auto_paginate is None else bool(auto_paginate)
             if effective_auto:
                 period1_rows = await _sa_query_all(user_email, site_url, period1_request, GSC_AUTO_PAGINATE_MAX_ROWS)
                 period2_rows = await _sa_query_all(user_email, site_url, period2_request, GSC_AUTO_PAGINATE_MAX_ROWS)
@@ -1859,9 +1865,32 @@ async def compare_search_periods(
                 f"(other period scanned up to {GSC_AUTO_PAGINATE_MAX_ROWS} rows to match keys)"
             )
         lines.append(f"Sort: {mode}")
+
+        # Totals are computed over ALL keys (the full union of both periods), independent of the
+        # print limit, so downstream KPI summing is always correct even when the table is truncated.
+        total_rows = len(deltas)
+        p1_clicks_total = sum(float((r1 or {}).get("clicks", 0) or 0) for _, _, _, _, _, r1, _ in deltas)
+        p1_impr_total = sum(float((r1 or {}).get("impressions", 0) or 0) for _, _, _, _, _, r1, _ in deltas)
+        p2_clicks_total = sum(float((r2 or {}).get("clicks", 0) or 0) for _, _, _, _, _, _, r2 in deltas)
+        p2_impr_total = sum(float((r2 or {}).get("impressions", 0) or 0) for _, _, _, _, _, _, r2 in deltas)
+        lines.append(
+            f"Totals (all {total_rows} keys) | "
+            f"P1 clicks={p1_clicks_total:.0f}, impr={p1_impr_total:.0f} | "
+            f"P2 clicks={p2_clicks_total:.0f}, impr={p2_impr_total:.0f} | "
+            f"ΔClicks={p2_clicks_total - p1_clicks_total:.0f}, ΔImpr={p2_impr_total - p1_impr_total:.0f}"
+        )
+
+        # limit None / 0 / negative => print every row (no silent truncation).
+        show_all = limit is None or int(limit) <= 0
+        max_print = total_rows if show_all else int(limit)
+        if not show_all and max_print < total_rows:
+            lines.append(
+                f"Note: showing top {max_print} of {total_rows} rows by '{mode}'. "
+                f"Set limit=0 (or omit it) to print all rows."
+            )
+
         lines.append("\nKeys | ClicksΔ | ImprΔ | CTRΔ | PosΔ | P1(clicks,impr,ctr,pos) | P2(clicks,impr,ctr,pos)")
-        count = 0
-        for k, cΔ, iΔ, ctrΔ, pΔ, r1, r2 in deltas:
+        for k, cΔ, iΔ, ctrΔ, pΔ, r1, r2 in deltas[:max_print]:
             dims = " / ".join([str(x) for x in k]) if k else "(total)"
             lines.append(
                 " | ".join([
@@ -1874,9 +1903,6 @@ async def compare_search_periods(
                     f"{r2.get('clicks',0):.0f},{r2.get('impressions',0):.0f},{(r2.get('ctr',0)*100):.2f}%,{r2.get('position',0):.1f}",
                 ])
             )
-            count += 1
-            if limit and count >= int(limit):
-                break
         return "\n".join(lines)
     except Exception as e:
         return f"Error comparing search periods: {str(e)}"
