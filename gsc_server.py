@@ -1866,28 +1866,8 @@ async def compare_search_periods(
             )
         lines.append(f"Sort: {mode}")
 
-        # Totals are computed over ALL keys (the full union of both periods), independent of the
-        # print limit, so downstream KPI summing is always correct even when the table is truncated.
-        total_rows = len(deltas)
-        p1_clicks_total = sum(float((r1 or {}).get("clicks", 0) or 0) for _, _, _, _, _, r1, _ in deltas)
-        p1_impr_total = sum(float((r1 or {}).get("impressions", 0) or 0) for _, _, _, _, _, r1, _ in deltas)
-        p2_clicks_total = sum(float((r2 or {}).get("clicks", 0) or 0) for _, _, _, _, _, _, r2 in deltas)
-        p2_impr_total = sum(float((r2 or {}).get("impressions", 0) or 0) for _, _, _, _, _, _, r2 in deltas)
-        lines.append(
-            f"Totals (all {total_rows} keys) | "
-            f"P1 clicks={p1_clicks_total:.0f}, impr={p1_impr_total:.0f} | "
-            f"P2 clicks={p2_clicks_total:.0f}, impr={p2_impr_total:.0f} | "
-            f"ΔClicks={p2_clicks_total - p1_clicks_total:.0f}, ΔImpr={p2_impr_total - p1_impr_total:.0f}"
-        )
-
         # limit None / 0 / negative => print every row (no silent truncation).
-        show_all = limit is None or int(limit) <= 0
-        max_print = total_rows if show_all else int(limit)
-        if not show_all and max_print < total_rows:
-            lines.append(
-                f"Note: showing top {max_print} of {total_rows} rows by '{mode}'. "
-                f"Set limit=0 (or omit it) to print all rows."
-            )
+        max_print = len(deltas) if (limit is None or int(limit) <= 0) else int(limit)
 
         lines.append("\nKeys | ClicksΔ | ImprΔ | CTRΔ | PosΔ | P1(clicks,impr,ctr,pos) | P2(clicks,impr,ctr,pos)")
         for k, cΔ, iΔ, ctrΔ, pΔ, r1, r2 in deltas[:max_print]:
