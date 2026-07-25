@@ -79,14 +79,16 @@ def _get_float_env(name: str, default_value: float) -> float:
 
 GSC_REQUEST_RETRIES = _get_int_env("GSC_REQUEST_RETRIES", 5)
 GSC_RETRY_BACKOFF_SECONDS = _get_float_env("GSC_RETRY_BACKOFF_SECONDS", 2.0)
-GSC_SLEEP_BETWEEN_REQUESTS_MS = _get_int_env("GSC_SLEEP_BETWEEN_REQUESTS_MS", 1000)
+# URL Inspection quota is 600 QPM/site (~10 QPS). Defaults stay well under that
+# (~3 concurrent × ~0.25s pace ≈ a few QPS once API latency is included).
+GSC_SLEEP_BETWEEN_REQUESTS_MS = _get_int_env("GSC_SLEEP_BETWEEN_REQUESTS_MS", 250)
 GSC_RETRY_JITTER_MS = _get_int_env("GSC_RETRY_JITTER_MS", 300)
 GSC_MAX_CONCURRENT_INSPECTIONS = _get_int_env("GSC_MAX_CONCURRENT_INSPECTIONS", 1)
 INSPECTION_SEMAPHORE = asyncio.Semaphore(max(1, GSC_MAX_CONCURRENT_INSPECTIONS))
 GSC_AUTO_PAGINATE_DEFAULT = os.getenv("GSC_AUTO_PAGINATE_DEFAULT", "false").lower() in ("1", "true", "yes")
 GSC_AUTO_PAGINATE_MAX_ROWS = _get_int_env("GSC_AUTO_PAGINATE_MAX_ROWS", 100000)
 GSC_SA_PAGE_SIZE = _get_int_env("GSC_SA_PAGE_SIZE", 25000)
-GSC_INTERNAL_INSPECTION_CONCURRENCY = _get_int_env("GSC_INTERNAL_INSPECTION_CONCURRENCY", 2)
+GSC_INTERNAL_INSPECTION_CONCURRENCY = _get_int_env("GSC_INTERNAL_INSPECTION_CONCURRENCY", 3)
 
 # Prefer a pre-provisioned OAuth token on disk (e.g., saved by HTTP callback) if available
 # Default to GOOGLE_MCP_CREDENTIALS_DIR/gsc_token.json, falling back to /data/gsc_token.json
