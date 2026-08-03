@@ -95,7 +95,8 @@ class GoogleOAuthProvider(OAuthProvider):
         )
         self._oauth_state_lock = threading.Lock()
 
-        # In-memory stores; clients + tokens also restored from disk when persistence is on
+        # In-memory stores; clients, tokens, pending Google state, and MCP auth
+        # codes are also restored from disk when persistence is on.
         self.clients: dict[str, OAuthClientInformationFull] = {}
         self.auth_codes: dict[str, AuthorizationCode] = {}
         self.access_tokens: dict[str, AccessToken] = {}
@@ -107,6 +108,9 @@ class GoogleOAuthProvider(OAuthProvider):
         self._auth_code_to_id_token: dict[str, str] = {}
         self._user_id_tokens: dict[str, str] = {}
         self.token_to_email: dict[str, str] = {}
+        # Consumed keys must not be resurrected by merge-before-write.
+        self._pending_tombstones: dict[str, float] = {}
+        self._auth_code_tombstones: dict[str, float] = {}
 
         if self._oauth_persist:
             self._load_oauth_state_from_disk_sync()
@@ -119,68 +123,205 @@ class GoogleOAuthProvider(OAuthProvider):
             self._oauth_persist,
         )
 
-    def _load_oauth_state_from_disk_sync(self) -> None:
-        """Load persisted MCP OAuth state (sync, called from __init__)."""
+    def _unpack_deserialized(self, parts: tuple) -> None:
+        (
+            clients,
+            access_tokens,
+            refresh_tokens,
+            token_to_email,
+            pending_authorizations,
+            auth_codes,
+            auth_code_to_email,
+            auth_code_to_id_token,
+            user_id_tokens,
+            pending_tombstones,
+            auth_code_tombstones,
+        ) = parts
+        self.clients = clients
+        self.access_tokens = access_tokens
+        self.refresh_tokens = refresh_tokens
+        self.token_to_email = token_to_email
+        self.pending_authorizations = pending_authorizations
+        self.auth_codes = auth_codes
+        self.auth_code_to_email = auth_code_to_email
+        self._auth_code_to_id_token = auth_code_to_id_token
+        self._user_id_tokens = user_id_tokens
+        self._pending_tombstones = pending_tombstones
+        self._auth_code_tombstones = auth_code_tombstones
+
+    def _merge_disk_into_memory(self, parts: tuple) -> None:
+        (
+            clients,
+            access_tokens,
+            refresh_tokens,
+            token_to_email,
+            pending_authorizations,
+            auth_codes,
+            auth_code_to_email,
+            auth_code_to_id_token,
+            user_id_tokens,
+            pending_tombstones,
+            auth_code_tombstones,
+        ) = parts
+        self.clients = _oauth_state_store.merge_dict(clients, self.clients)
+        self.access_tokens = _oauth_state_store.merge_dict(
+            access_tokens, self.access_tokens
+        )
+        self.refresh_tokens = _oauth_state_store.merge_dict(
+            refresh_tokens, self.refresh_tokens
+        )
+        self.token_to_email = _oauth_state_store.merge_dict(
+            token_to_email, self.token_to_email
+        )
+        self.pending_authorizations = _oauth_state_store.merge_dict(
+            pending_authorizations, self.pending_authorizations
+        )
+        self.auth_codes = _oauth_state_store.merge_dict(auth_codes, self.auth_codes)
+        self.auth_code_to_email = _oauth_state_store.merge_dict(
+            auth_code_to_email, self.auth_code_to_email
+        )
+        self._auth_code_to_id_token = _oauth_state_store.merge_dict(
+            auth_code_to_id_token, self._auth_code_to_id_token
+        )
+        self._user_id_tokens = _oauth_state_store.merge_dict(
+            user_id_tokens, self._user_id_tokens
+        )
+        self._pending_tombstones = _oauth_state_store.merge_dict(
+            pending_tombstones, self._pending_tombstones
+        )
+        self._auth_code_tombstones = _oauth_state_store.merge_dict(
+            auth_code_tombstones, self._auth_code_tombstones
+        )
+        for state in self._pending_tombstones:
+            self.pending_authorizations.pop(state, None)
+        for code in self._auth_code_tombstones:
+            self.auth_codes.pop(code, None)
+            self.auth_code_to_email.pop(code, None)
+            self._auth_code_to_id_token.pop(code, None)
+
+    def _serialize_current_state(self) -> dict:
+        return _oauth_state_store.serialize_state(
+            self.clients,
+            self.access_tokens,
+            self.refresh_tokens,
+            self.token_to_email,
+            self.pending_authorizations,
+            self.auth_codes,
+            self.auth_code_to_email,
+            self._auth_code_to_id_token,
+            self._user_id_tokens,
+            self._pending_tombstones,
+            self._auth_code_tombstones,
+        )
+
+    def _prune_current_state(self) -> None:
+        _oauth_state_store.prune_expired(
+            self.access_tokens,
+            self.refresh_tokens,
+            self.token_to_email,
+            self.pending_authorizations,
+            self.auth_codes,
+            self.auth_code_to_email,
+            self._auth_code_to_id_token,
+        )
+
+    def _load_oauth_state_from_disk_sync(self) -> bool:
+        """Load persisted MCP OAuth state at startup (under file lock)."""
         try:
-            raw = _oauth_state_store.read_mcp_oauth_state(self._oauth_state_path)
-            if not raw:
-                return
-            clients, access_tokens, refresh_tokens, token_to_email = (
-                _oauth_state_store.deserialize_state(raw)
-            )
-            self.clients = clients
-            self.access_tokens = access_tokens
-            self.refresh_tokens = refresh_tokens
-            self.token_to_email = token_to_email
-            _oauth_state_store.prune_expired(
-                self.access_tokens, self.refresh_tokens, self.token_to_email
-            )
-            _oauth_state_store.write_mcp_oauth_state_atomic(
-                self._oauth_state_path,
-                _oauth_state_store.serialize_state(
-                    self.clients,
-                    self.access_tokens,
-                    self.refresh_tokens,
-                    self.token_to_email,
-                ),
-            )
+            with _oauth_state_store.oauth_state_file_lock(self._oauth_state_path):
+                raw = _oauth_state_store.read_mcp_oauth_state(self._oauth_state_path)
+                if not raw:
+                    return False
+                self._unpack_deserialized(
+                    _oauth_state_store.deserialize_state(raw)
+                )
+                self._prune_current_state()
+                _oauth_state_store.write_mcp_oauth_state_atomic(
+                    self._oauth_state_path,
+                    self._serialize_current_state(),
+                )
             logger.info(
-                "Restored MCP OAuth state: %d clients, %d access, %d refresh tokens",
+                "Restored MCP OAuth state from disk: %d clients, %d access tokens, "
+                "%d refresh tokens, %d pending, %d auth codes",
                 len(self.clients),
                 len(self.access_tokens),
                 len(self.refresh_tokens),
+                len(self.pending_authorizations),
+                len(self.auth_codes),
             )
+            return True
         except Exception as e:
-            logger.error("Failed to load MCP OAuth state: %s", e, exc_info=True)
+            logger.warning("Could not load MCP OAuth state from disk: %s", e, exc_info=True)
+            return False
 
     def _persist_oauth_state_sync(self) -> None:
-        """Write MCP OAuth state to disk (clients + tokens + email mapping)."""
+        """Merge-before-write under cross-process lock (avoids last-writer-wins)."""
         if not self._oauth_persist:
             return
         with self._oauth_state_lock:
-            _oauth_state_store.prune_expired(
-                self.access_tokens, self.refresh_tokens, self.token_to_email
-            )
-            payload = _oauth_state_store.serialize_state(
-                self.clients,
-                self.access_tokens,
-                self.refresh_tokens,
-                self.token_to_email,
-            )
-            _oauth_state_store.write_mcp_oauth_state_atomic(
-                self._oauth_state_path,
-                payload,
-            )
+            with _oauth_state_store.oauth_state_file_lock(self._oauth_state_path):
+                raw = _oauth_state_store.read_mcp_oauth_state(self._oauth_state_path)
+                if raw:
+                    self._merge_disk_into_memory(
+                        _oauth_state_store.deserialize_state(raw)
+                    )
+                self._prune_current_state()
+                _oauth_state_store.write_mcp_oauth_state_atomic(
+                    self._oauth_state_path,
+                    self._serialize_current_state(),
+                )
 
     async def _persist_oauth_state(self) -> None:
         await asyncio.to_thread(self._persist_oauth_state_sync)
+
+    def _reload_oauth_state_from_disk_locked(self) -> None:
+        """Merge disk state into memory (lookup miss after restart / other worker)."""
+        if not self._oauth_persist:
+            return
+        with self._oauth_state_lock:
+            with _oauth_state_store.oauth_state_file_lock(self._oauth_state_path):
+                raw = _oauth_state_store.read_mcp_oauth_state(self._oauth_state_path)
+                if not raw:
+                    return
+                self._merge_disk_into_memory(
+                    _oauth_state_store.deserialize_state(raw)
+                )
+                self._prune_current_state()
+            logger.info(
+                "Merged MCP OAuth state from disk: %d clients, %d pending, %d auth codes",
+                len(self.clients),
+                len(self.pending_authorizations),
+                len(self.auth_codes),
+            )
+
+    def _tombstone_pending(self, google_state: str) -> None:
+        self.pending_authorizations.pop(google_state, None)
+        self._pending_tombstones[google_state] = time.time()
+
+    def _tombstone_auth_code(self, code: str) -> None:
+        self.auth_codes.pop(code, None)
+        self.auth_code_to_email.pop(code, None)
+        self._auth_code_to_id_token.pop(code, None)
+        self._auth_code_tombstones[code] = time.time()
 
     # ------------------------------------------------------------------
     # Client registration
     # ------------------------------------------------------------------
 
     async def get_client(self, client_id: str) -> Optional[OAuthClientInformationFull]:
-        return self.clients.get(client_id)
+        client = self.clients.get(client_id)
+        if client is not None:
+            return client
+        if self._oauth_persist:
+            await asyncio.to_thread(self._reload_oauth_state_from_disk_locked)
+            client = self.clients.get(client_id)
+        if client is None:
+            logger.error(
+                "/token or auth lookup: unknown DCR client_id=%s "
+                "(not in memory or disk — multi-instance wipe or never registered)",
+                client_id,
+            )
+        return client
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         self.clients[client_info.client_id] = client_info
@@ -205,7 +346,9 @@ class GoogleOAuthProvider(OAuthProvider):
             "state": params.state,
             "code_challenge": params.code_challenge,
             "scopes": scopes,
+            "created_at": time.time(),
         }
+        await self._persist_oauth_state()
 
         google_params: dict[str, str] = {
             "response_type": "code",
@@ -262,13 +405,31 @@ class GoogleOAuthProvider(OAuthProvider):
             )
 
         pending = self.pending_authorizations.pop(google_state, None)
+        if not pending and self._oauth_persist:
+            # Survives process restart mid-login (common on Render deploys).
+            await asyncio.to_thread(self._reload_oauth_state_from_disk_locked)
+            pending = self.pending_authorizations.pop(google_state, None)
+        if pending is not None:
+            self._tombstone_pending(google_state)
         if not pending:
-            logger.error("Unknown state in Google callback: %s", google_state)
+            logger.error(
+                "Unknown state in Google callback: %s "
+                "(authorize and callback must share the same process memory or "
+                "persisted OAuth state; multi-instance hosts need sticky sessions "
+                "or a shared store)",
+                google_state,
+            )
             return RedirectResponse(
                 construct_redirect_uri(
                     "about:blank",
                     error="invalid_request",
-                    error_description="Unknown or expired state",
+                    error_description=(
+                        "Unknown or expired OAuth state. This usually means the "
+                        "MCP host lost in-flight login state (restart or another "
+                        "instance). Retry sign-in; if it keeps failing, the host "
+                        "must use a single instance, sticky sessions, or shared "
+                        "OAuth state persistence."
+                    ),
                 )
             )
 
@@ -301,6 +462,8 @@ class GoogleOAuthProvider(OAuthProvider):
         # Store Google credentials on disk (persistent across restarts)
         self._store_google_credentials(user_email, token_data)
 
+        google_id_token = token_data.get("id_token")
+
         # Generate MCP authorization code
         mcp_code = secrets.token_urlsafe(32)
         self.auth_codes[mcp_code] = AuthorizationCode(
@@ -313,10 +476,11 @@ class GoogleOAuthProvider(OAuthProvider):
             code_challenge=pending["code_challenge"],
         )
         self.auth_code_to_email[mcp_code] = user_email
-        google_id_token = token_data.get("id_token")
         if google_id_token:
             self._auth_code_to_id_token[mcp_code] = google_id_token
             self._user_id_tokens[user_email] = google_id_token
+
+        await self._persist_oauth_state()
 
         logger.info(
             "Google callback success: user=%s, redirecting to client", user_email
@@ -426,22 +590,56 @@ class GoogleOAuthProvider(OAuthProvider):
         self, client: OAuthClientInformationFull, authorization_code: str
     ) -> Optional[AuthorizationCode]:
         ac = self.auth_codes.get(authorization_code)
+        if ac is None and self._oauth_persist:
+            await asyncio.to_thread(self._reload_oauth_state_from_disk_locked)
+            ac = self.auth_codes.get(authorization_code)
         if not ac:
+            logger.error(
+                "/token: authorization code not found (code_prefix=%s…, client_id=%s). "
+                "Callback may have hit another worker whose auth_codes were wiped, "
+                "or the code expired/already consumed.",
+                authorization_code[:8] if authorization_code else "",
+                client.client_id,
+            )
             return None
         if ac.client_id != client.client_id:
+            logger.error(
+                "/token: authorization code client_id mismatch "
+                "(code client=%s, request client=%s)",
+                ac.client_id,
+                client.client_id,
+            )
             return None
         if ac.expires_at < time.time():
-            self.auth_codes.pop(authorization_code, None)
-            self.auth_code_to_email.pop(authorization_code, None)
+            logger.error(
+                "/token: authorization code expired (client_id=%s, age_skew)",
+                client.client_id,
+            )
+            self._tombstone_auth_code(authorization_code)
+            await self._persist_oauth_state()
             return None
         return ac
 
     async def exchange_authorization_code(
         self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
     ) -> OAuthToken:
-        self.auth_codes.pop(authorization_code.code, None)
-        user_email = self.auth_code_to_email.pop(authorization_code.code, None)
-        google_id_token = self._auth_code_to_id_token.pop(authorization_code.code, None)
+        user_email = self.auth_code_to_email.get(authorization_code.code)
+        google_id_token = self._auth_code_to_id_token.get(authorization_code.code)
+        if user_email is None and self._oauth_persist:
+            await asyncio.to_thread(self._reload_oauth_state_from_disk_locked)
+            user_email = self.auth_code_to_email.get(authorization_code.code)
+            google_id_token = (
+                self._auth_code_to_id_token.get(authorization_code.code)
+                or google_id_token
+            )
+        if user_email is None:
+            logger.error(
+                "/token: auth code has no email mapping (client_id=%s, code_prefix=%s…). "
+                "Google callback may not have persisted auth_code_to_email.",
+                client.client_id,
+                authorization_code.code[:8],
+            )
+        self._tombstone_auth_code(authorization_code.code)
 
         access_token_value = secrets.token_urlsafe(32)
         refresh_token_value = secrets.token_urlsafe(32)
@@ -491,6 +689,9 @@ class GoogleOAuthProvider(OAuthProvider):
         self, client: OAuthClientInformationFull, refresh_token: str
     ) -> Optional[RefreshToken]:
         rt = self.refresh_tokens.get(refresh_token)
+        if rt is None and self._oauth_persist:
+            await asyncio.to_thread(self._reload_oauth_state_from_disk_locked)
+            rt = self.refresh_tokens.get(refresh_token)
         if not rt:
             return None
         if rt.client_id != client.client_id:
@@ -577,6 +778,9 @@ class GoogleOAuthProvider(OAuthProvider):
 
     async def load_access_token(self, token: str) -> Optional[AccessToken]:
         at = self.access_tokens.get(token)
+        if at is None and self._oauth_persist:
+            await asyncio.to_thread(self._reload_oauth_state_from_disk_locked)
+            at = self.access_tokens.get(token)
         if not at:
             prefix = token[:12] if len(token) > 12 else token
             logger.warning(

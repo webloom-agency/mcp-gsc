@@ -814,7 +814,7 @@ The MCP endpoint is served at `POST/GET /mcp` (Streamable HTTP). The OAuth endpo
 | `GA4_MCP_BASE_URI` / `GA4_EXTERNAL_URL` | HTTP | Public base URL of the server (used to build redirect + metadata). Set `GA4_EXTERNAL_URL` to your `https://` domain in production. |
 | `PORT` | HTTP | Listen port (default 8000). Render sets this automatically. |
 | `GOOGLE_MCP_CREDENTIALS_DIR` | HTTP | **Persistent** directory for per-user Google tokens + MCP OAuth state. Point at a mounted disk. |
-| `MCP_OAUTH_STATE_PERSIST` | HTTP | `true` (default) to persist MCP clients/tokens across restarts. |
+| `MCP_OAUTH_STATE_PERSIST` | HTTP | `true` (default) to persist DCR clients, in-flight Google OAuth pending state, MCP auth codes, and MCP tokens across restarts. Still requires a **single instance** (or sticky sessions / shared store) when scaling horizontally. |
 | `MCP_BEARER_TOKEN` | HTTP | Static shared token gate when OAuth 2.1 is disabled. |
 | `GA4_SKIP_OAUTH` | stdio | `true` to force service-account-only auth. |
 | `GA4_CREDENTIALS_PATH` | stdio | Path to a service-account JSON. |
@@ -876,18 +876,28 @@ GOOGLE_OAUTH_CLIENT_ID=xxxxx.apps.googleusercontent.com
 GOOGLE_OAUTH_CLIENT_SECRET=xxxxx
 GA4_EXTERNAL_URL=https://your-service.onrender.com
 GOOGLE_MCP_CREDENTIALS_DIR=/data
+# Persists DCR clients + pending Google OAuth state + MCP auth codes + tokens.
+# Required so restarts mid-login don't break /oauth2callback. Keep a single
+# instance (or sticky sessions / shared store) if you scale horizontally.
 MCP_OAUTH_STATE_PERSIST=true
 ```
 
 - In Google Cloud, add the redirect URI `https://your-service.onrender.com/oauth2callback` to your
   **Web** OAuth client.
 
+> **Stay on one instance.** Pending Google OAuth `state` and short-lived MCP auth codes are
+> persisted under `GOOGLE_MCP_CREDENTIALS_DIR`, so a **restart mid-login** no longer breaks the
+> callback. That disk is still single-instance on typical PaaS hosts: if you scale to multiple
+> dynos without sticky sessions (or a shared Redis/DB store), authorize and `/oauth2callback` can
+> land on different processes and login fails with `Unknown state` / `/token` 401.
+
 ### 13.2 What persistence buys you
 
 - `GOOGLE_MCP_CREDENTIALS_DIR/<email>.json` — each user's Google refresh token. After first login,
   the server refreshes the Google access token automatically; the user never re-consents.
-- `GOOGLE_MCP_CREDENTIALS_DIR/mcp_oauth/server_state.json` — registered MCP clients + issued MCP
-  tokens, so a redeploy doesn't invalidate active client sessions.
+- `GOOGLE_MCP_CREDENTIALS_DIR/mcp_oauth/server_state.json` — registered MCP clients, in-flight
+  Google OAuth pending state, MCP auth codes, and issued MCP tokens, so a redeploy doesn't
+  invalidate active client sessions or break mid-login.
 
 Because both live on the mounted disk, **restarts and redeploys preserve every user's login** —
 which is the core requirement.
