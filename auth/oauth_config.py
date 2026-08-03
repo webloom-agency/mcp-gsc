@@ -86,7 +86,7 @@ class OAuthConfig:
             "jwks_uri": "https://www.googleapis.com/oauth2/v3/certs",
             "response_types_supported": ["code", "token"],
             "grant_types_supported": ["authorization_code", "refresh_token"],
-            "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
+            "token_endpoint_auth_methods_supported": ["client_secret_post"],
             "code_challenge_methods_supported": self.supported_code_challenge_methods,
         }
         if scopes is not None:

@@ -41,8 +41,11 @@ from fastmcp.server.auth.auth import OAuthProvider, AccessToken, ClientRegistrat
 from auth.scopes import SCOPES as GSC_SCOPES
 from auth.credential_store import get_credential_store, get_credential_storage_directory
 from auth import mcp_oauth_state_store as _oauth_state_store
+from auth.mcp_client_auth_compat import apply_mcp_client_auth_compat
 
 logger = logging.getLogger(__name__)
+
+apply_mcp_client_auth_compat()
 
 
 class _OAuthTokenWithIdToken(OAuthToken):
